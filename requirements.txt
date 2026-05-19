@@ -1,0 +1,12 @@
+qiskit
+numpy
+pandas
+networkx
+matplotlib
+python-sat[pblib,aiger]
+pyzx
+mqt.qcec
+pytket
+pytket-qiskit
+pynauty
+scipy
