@@ -1,198 +1,213 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ZX Normalization Sensitivity
-============================
+IJQI REPRODUCIBLE RESEARCH ENGINE -- PAULI ANTICOMMUTATION SENSITIVITY
+==========================================================
 
-Experimental framework for studying representation-sensitive dependency
-abstractions in ZX-normalized Clifford+T circuits.
+Single-file publication implementation of the revised IJQI model.
 
-The pipeline evaluates the map
+NO command-line arguments are used.
+Edit the CONFIG section and press Run in Spyder.
 
-    C  ->  N(C)  ->  G_T(N(C))  ->  chi(G_T(N(C)))
+Purpose
+-------
+The same file runs the balanced benchmark study, regenerates the 4-qubit
+three-path witness, computes exact five-T minimality certificates, and exports
+paper-ready tables and figures. No helper Python files are required.
 
-where C is an input circuit, N is a semantics-preserving normalization or
-extraction strategy, G_T is the induced T-dependency graph, and chi denotes
-the graph chromatic number.
+Pipeline
+--------
+    original circuit
+      -> selected normalization strategy
+      -> equivalence guard
+      -> exact Clifford+T rebase
+      -> explicit T/Tdg event extraction
+      -> suffix-Clifford Pauli signatures
+      -> Pauli anticommutation graph
+      -> exact chromatic number
+      -> exact graph-isomorphism classification
+      -> T-count-matched sensitivity analysis
 
-The script is intended for reproducibility of the experiments reported in
+Scientific interpretation
+-------------------------
+The graph edge relation is algebraic and independent of coloring:
 
-    Semantic Equivalence and Dependency-Graph Sensitivity in
-    ZX-Normalized Clifford+T Circuits
+    {i,j} in E  <=>  <P_i,P_j>_sp = 1 (mod 2).
 
-Main steps
-----------
-1. Generate structured and randomized Clifford+T benchmark circuits.
-2. Apply several ZX/Qiskit/tket normalization and extraction strategies.
-3. Retain only variants passing the equivalence checks used in the analysis.
-4. Construct T-dependency graphs from the normalized representations.
-5. Compute graph-optimal T-layer values through SAT-based graph coloring.
-6. Record graph diversity, chromatic diversity, replay gaps, and family-level
-   sensitivity summaries.
-7. Export CSV, JSON, LaTeX, GraphML, and figure artifacts.
+The chromatic number is interpreted only as:
 
-Dependencies
-------------
-Required:
-    qiskit, numpy, pandas, networkx, matplotlib, python-sat
+    minimum number of mutually commuting Pauli-signature classes
 
-Recommended:
-    pyzx, mqt.qcec, pytket, pynauty, scipy
+for the fixed extracted/rebased representation.
 
-Typical runs
-------------
-Quick sanity check:
-    python zx_normalization_sensitivity.py --outdir artifacts_normsens --quick
+It is NOT claimed to equal physical T-depth or executable schedule depth.
 
-Medium experiment:
-    python zx_normalization_sensitivity.py --outdir artifacts_normsens --medium --pairwise-equivalence
+Design goals of this pilot
+--------------------------
+1. Test whether the revised abstraction is non-degenerate on real benchmarks.
+2. Test whether different semantics-preserving normalizations induce
+   non-isomorphic anticommutation graphs.
+3. Test whether exact chromatic number varies.
+4. Most importantly, test whether chromatic variation survives exact T-count
+   matching between normalizations of the same original circuit.
+5. Produce small witness candidates for manual inspection.
+6. Keep every branch auditable: normalization trace, equivalence status,
+   Pauli event table, edge witnesses, graph class, exact coloring.
 
-Larger experiment:
-    python zx_normalization_sensitivity.py --outdir artifacts_normsens --large --pairwise-equivalence --random-seeds 0 1 2 3 4
+V8.3.2 correction
+-----------------
+Zero-T representations are legitimate outcomes. Empty event/edge tables now retain fixed schemas, so such branches are analyzed as G=empty and chi=0 rather than raising KeyError('event_id'). High-level compiler outputs that leave the exact pi/4 event model are explicitly classified as `exact_CT_model_out_of_domain`; no numerical angle rounding is allowed.
 
-External OpenQASM 2 benchmark directory:
-    python zx_normalization_sensitivity.py --outdir artifacts_normsens --medium --qasm-dir path/to/qasm
-
-Notes
------
-Failed extraction or failed equivalence checks are quarantined and are not used
-as evidence for normalization sensitivity. Sensitivity claims are based only on
-variants that pass the equivalence guard.
+Fail-closed policy
+------------------
+- Unsupported exact Clifford+T rebase -> branch rejected.
+- Equivalence failure -> branch rejected from claims.
+- Unknown equivalence -> branch retained only as diagnostic, not used in claims.
+- Any core self-test failure -> entire pilot stops.
 """
 
 from __future__ import annotations
 
-import argparse
-import signal
-import csv
-import dataclasses
-import hashlib
-import itertools
 import json
 import math
-import os
 import random
-import re
-import shutil
-import statistics
-import sys
-import time
+import hashlib
+import itertools
 import traceback
-import warnings
-warnings.filterwarnings("ignore", category=DeprecationWarning)
-warnings.filterwarnings("ignore", message=".*implicit qubit permutations.*")
-import zipfile
-
-# Keep long Spyder runs readable. These warnings do not affect the
-# normalization-sensitivity analysis and are recorded only as environment noise.
-warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"qiskit\..*")
-warnings.filterwarnings("ignore", category=PendingDeprecationWarning, module=r"qiskit\..*")
-from collections import Counter, defaultdict
+import re
+import time
+import platform
+import sys
+from collections import Counter
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 import networkx as nx
 
+# =============================================================================
+# CONFIG -- edit here in Spyder
+# =============================================================================
+
+# Choose ONE profile and press F5 in Spyder.  Paper reproduces 220 x 13 branches.
+# "witness" checks only the three PyZX paths; "quick" is a small smoke test.
+RUN_PROFILE = "paper"             # "paper", "witness", or "quick"
+RESUME_INTERRUPTED_RUN = True       # reuse completed rows only for unchanged source
+SAVE_ZX_WITNESS_SNAPSHOTS = True
+VERIFY_EXACT_WITNESS_CHANNEL = True
+EXPORT_PAPER_FIGURES = True
+EXPECTED_WITNESS_CIRCUIT = "VQE_slot07_vqe_su2_n4_r3_s7"
+EXPECTED_WITNESS_CHI = {"pyzx_no_simp": 3, "pyzx_clifford_simp": 2,
+                        "pyzx_pivot_only": 3}
+
+# Output is anchored to the actual script directory, not Spyder's cwd.
+_SCRIPT_HOME = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
+OUTPUT_DIR = _SCRIPT_HOME / ("zx_normalization_sensitivity_output_" + RUN_PROFILE)
 
 
-# ---------------------------------------------------------------------------
-# GraphML export helpers
-# ---------------------------------------------------------------------------
-# NetworkX's GraphML writer accepts only primitive scalar attributes.  The
-# dependency graphs used in this script deliberately store rich provenance
-# values such as tuples/lists/dicts (e.g. qubit sets or blocker descriptions).
-# Those are valid Python/JSON artifacts but invalid GraphML attributes.  Before
-# writing .graphml files, sanitize every node/edge attribute without changing
-# the graph used for analysis.
+# Core checks must stay enabled for scientific runs.
+RUN_CORE_SELF_TESTS = True
 
-def _graphml_safe_scalar(value: Any) -> Any:
-    if value is None:
-        return ""
-    if isinstance(value, (str, int, float, bool)):
-        return value
-    if isinstance(value, (np.integer,)):
-        return int(value)
-    if isinstance(value, (np.floating,)):
-        return float(value)
-    if isinstance(value, (np.bool_,)):
-        return bool(value)
-    try:
-        return json.dumps(value, sort_keys=True, default=str)
-    except Exception:
-        return str(value)
+# Save per-variant GraphML and CSV artifacts.
+SAVE_GRAPHML = True
+SAVE_QASM = True
 
-def graphml_safe_copy(G: nx.Graph) -> nx.Graph:
-    H = G.__class__()
-    H.graph.update({str(k): _graphml_safe_scalar(v) for k, v in G.graph.items()})
-    for node, data in G.nodes(data=True):
-        H.add_node(str(node), **{str(k): _graphml_safe_scalar(v) for k, v in data.items()})
-    for u, v, data in G.edges(data=True):
-        H.add_edge(str(u), str(v), **{str(k): _graphml_safe_scalar(val) for k, val in data.items()})
-    return H
+# Equivalence:
+MAX_OPERATOR_CHECK_QUBITS = 8
+MATRIX_ATOL = 1e-9
 
-def write_graphml_safe(G: nx.Graph, path: Path) -> None:
-    nx.write_graphml(graphml_safe_copy(G), path)
+# Targeted pilot size.
+# This is designed to produce ~25-30 circuits depending on library availability.
+RANDOM_SEEDS = [0, 1, 2]
 
+# Primary analysis = PyZX strategies.
+# Qiskit strategies are included as secondary compiler baselines.
+INCLUDE_QISKIT_BASELINES = True
 
-try:
-    import matplotlib
-    matplotlib.use("Agg")
-    warnings.filterwarnings("ignore", category=DeprecationWarning, module="qiskit.*")
-    warnings.filterwarnings("ignore", message=".*EfficientSU2.*deprecated.*")
-    warnings.filterwarnings("ignore", message=".*RealAmplitudes.*deprecated.*")
-    warnings.filterwarnings("ignore", message=".*implicit qubit permutations.*")
-    import matplotlib.pyplot as plt
-    HAVE_MPL = True
-except Exception:
-    HAVE_MPL = False
+# Optional tket baseline. Leave False for first pilot unless already installed.
+INCLUDE_TKET = False
+
+# PyZX random-mix seeds.
+PYZX_RANDOM_SEEDS = [0, 1, 2]
+
+# Exact coloring cross-check with python-sat if available.
+USE_SAT_CROSSCHECK = True
+
+# Safety threshold for operator matrix equivalence.
+# Above this, MQT-QCEC is used if installed; otherwise statevector fallback
+# may become inconclusive rather than falsely passing.
+MAX_STATEVECTOR_QUBITS = 10
+
+# Witness shortlist size.
+
+TOP_WITNESSES = 20
+
+# Publication-scale balanced design: 22 predeclared families x 10 circuits.
+PUBLICATION_FAMILIES = 22
+CIRCUITS_PER_FAMILY = 10
+EXPECTED_PUBLICATION_CIRCUITS = PUBLICATION_FAMILIES * CIRCUITS_PER_FAMILY
+LOCK_BALANCED_SUITE = True
+
+# Deep reviewer-facing validation.
+# These checks are deliberately redundant: binary symplectic propagation is
+# cross-checked against direct matrix conjugation, and the Pauli-rotation
+# decomposition is reconstructed projectively for small circuits.
+RUN_DEEP_PAULI_VALIDATION = True
+MAX_DIRECT_PAULI_VALIDATION_QUBITS = 5
+MAX_RECONSTRUCTION_QUBITS = 5
+
+# A publication witness is accepted as "hand-checkable exact" only when its
+# upper bound is an explicit proper coloring and its lower bound is an explicit
+# clique of the same size.  SAT may still be used elsewhere as a cross-check.
+REQUIRE_CLIQUE_CERTIFICATE_FOR_PRIMARY_WITNESS = True
+
+# Store exhaustive pairwise commutation checks for small circuits only in JSON
+# summary form; edge CSVs remain the compact edge-level witness.
+SAVE_DIRECT_MATRIX_VALIDATION_DETAILS = True
+
+# Reviewer-facing coverage / robustness analyses.
+RUN_STRATEGY_SATURATION = True
+SATURATION_PERMUTATIONS = 100
+RUN_LEAVE_ONE_STRATEGY_OUT = True
+
+# Timing / scalability accounting.
+COLLECT_PERFORMANCE_METRICS = True
+
+# All randomness used only for analysis ordering is fixed and recorded.
+ANALYSIS_RANDOM_SEED = 20260820
+
+# =============================================================================
+# Imports
+# =============================================================================
 
 try:
     from qiskit import QuantumCircuit, transpile
-    from qiskit.circuit import QuantumRegister
-    from qiskit.circuit.library import EfficientSU2, QFT, TwoLocal, RealAmplitudes, MCXGate, RZGate, RXGate, RYGate
-    from qiskit.quantum_info import Statevector, Operator
+    from qiskit.quantum_info import Operator, Statevector
     try:
         from qiskit.qasm2 import dumps as qasm2_dumps, loads as qasm2_loads
     except Exception:
         qasm2_dumps = None
         qasm2_loads = None
-    # Run policy: do not use QASM3 anywhere in the
-    # normalization pipeline. QASM3 optional importers created environment
-    # noise in earlier runs. External .qasm3 files are skipped explicitly.
-    qasm3 = None
     HAVE_QISKIT = True
 except Exception as e:
     HAVE_QISKIT = False
-    QISKIT_IMPORT_ERROR = str(e)
+    QISKIT_IMPORT_ERROR = repr(e)
 
 try:
     import pyzx as zx
     HAVE_PYZX = True
-except Exception:
+except Exception as e:
     HAVE_PYZX = False
+    PYZX_IMPORT_ERROR = repr(e)
 
 try:
     from pysat.formula import CNF
-    from pysat.solvers import Minisat22, Glucose3
+    from pysat.solvers import Minisat22
     HAVE_PYSAT = True
 except Exception:
     HAVE_PYSAT = False
-
-try:
-    from scipy import sparse
-    from scipy.sparse.linalg import eigsh
-    HAVE_SCIPY = True
-except Exception:
-    HAVE_SCIPY = False
-
-try:
-    import pynauty
-    HAVE_PYNAUTY = True
-except Exception:
-    HAVE_PYNAUTY = False
 
 try:
     from mqt import qcec as mqt_qcec
@@ -200,696 +215,1128 @@ try:
 except Exception:
     HAVE_QCEC = False
 
-# tket API changed across versions. Import converters and the passes module
-# separately, then choose an available pass dynamically. Earlier versions of
-# this script imported PeepholeOptimise directly, which fails on newer pytket
-# versions even when pytket itself is installed correctly.
 try:
     from pytket.extensions.qiskit import qiskit_to_tk, tk_to_qiskit
     import pytket.passes as _tket_passes
     HAVE_TKET = True
-    TKET_IMPORT_ERROR = None
-    TKET_AVAILABLE_PASSES = [name for name in dir(_tket_passes) if not name.startswith("_")]
-except Exception as _tket_e:
+except Exception as e:
     HAVE_TKET = False
-    TKET_IMPORT_ERROR = repr(_tket_e)
-    TKET_AVAILABLE_PASSES = []
+    TKET_IMPORT_ERROR = repr(e)
 
-def _select_tket_pass():
-    """Return (pass_name, pass_instance) for the active pytket version.
+# =============================================================================
+# Helpers
+# =============================================================================
 
-    Preference order keeps the intended role: an external compiler-level
-    normalization/optimization baseline. If no optimization pass is available,
-    return (None, None) and the tket strategy performs a conversion-only
-    normalization rather than failing.
-    """
-    if not HAVE_TKET:
-        return None, None
-    candidates = [
-        "FullPeepholeOptimise",
-        "PeepholeOptimise",
-        "CliffordSimp",
-        "SynthesiseTket",
-        "SynthesiseTK",
-        "RebaseTket",
-    ]
-    for cname in candidates:
-        cls = getattr(_tket_passes, cname, None)
-        if cls is None:
-            continue
-        try:
-            return cname, cls()
-        except Exception:
-            continue
-    return None, None
+def ensure_dir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
 
-ANGLE_TOL_DEFAULT = 1e-7
-T_NAMES = {"t", "tdg"}
-Z_PHASE_NAMES = {"z", "s", "sdg", "t", "tdg", "rz", "p", "u1"}
-
-
-
-class TimeoutExpired(Exception):
-    pass
-
-class time_limit:
-    """Unix-only soft timeout used to prevent a single normalization/equivalence
-    branch from blocking a long publication run. It does not alter the scientific
-    pipeline: timed-out branches are quarantined with failure_category=timeout.
-    """
-    def __init__(self, seconds: int | float | None):
-        try:
-            self.seconds = int(seconds) if seconds is not None else 0
-        except Exception:
-            self.seconds = 0
-        self.old_handler = None
-
-    def _handle(self, signum, frame):
-        raise TimeoutExpired(f"timeout after {self.seconds}s")
-
-    def __enter__(self):
-        if self.seconds and self.seconds > 0 and hasattr(signal, "SIGALRM"):
-            self.old_handler = signal.signal(signal.SIGALRM, self._handle)
-            signal.alarm(self.seconds)
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        if self.seconds and self.seconds > 0 and hasattr(signal, "SIGALRM"):
-            signal.alarm(0)
-            if self.old_handler is not None:
-                signal.signal(signal.SIGALRM, self.old_handler)
-        return False
-
-# ---------------------------------------------------------------------------
-# Utility
-# ---------------------------------------------------------------------------
-
-def ensure_dir(p: str | Path) -> None:
-    Path(p).mkdir(parents=True, exist_ok=True)
-
-
-def now() -> str:
-    return time.strftime("%Y-%m-%d %H:%M:%S")
-
+def json_dump(path: Path, obj: Any) -> None:
+    ensure_dir(path.parent)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, sort_keys=True, default=str)
 
 def safe_name(s: str) -> str:
-    out = []
-    for ch in str(s):
-        out.append(ch if ch.isalnum() or ch in "._-" else "_")
-    return "".join(out)[:180]
-
+    return "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in str(s))[:180]
 
 def sha256_text(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8", errors="ignore")).hexdigest()
 
+def qid_map(qc: QuantumCircuit) -> Dict[Any, int]:
+    return {q: i for i, q in enumerate(qc.qubits)}
 
-def json_dump(path: str | Path, obj: Any) -> None:
-    ensure_dir(Path(path).parent)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(obj, f, indent=2, sort_keys=True, default=str)
+def gate_histogram(qc: QuantumCircuit) -> Dict[str, int]:
+    c = Counter(inst.operation.name.lower() for inst in qc.data)
+    return dict(sorted(c.items()))
 
+# =============================================================================
+# Exact Clifford+T rebase
+# =============================================================================
 
-def text_write(path: str | Path, txt: str) -> None:
-    ensure_dir(Path(path).parent)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(txt)
+ALLOWED_CT = {"h", "x", "z", "s", "sdg", "t", "tdg", "cx", "id", "barrier"}
 
+def normalize_angle_pi_over_4(theta: float, tol: float = 1e-10) -> int:
+    x = float(theta) / (math.pi / 4.0)
+    k = int(round(x))
+    if abs(x - k) > tol:
+        raise ValueError(
+            f"Angle {theta!r} is not an exact multiple of pi/4 within tol={tol}"
+        )
+    return k % 8
 
-def append_log(path: str | Path, msg: str) -> None:
-    ensure_dir(Path(path).parent)
-    line = f"[{now()}] {msg}\n"
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(line)
-    print(msg)
+def append_phase_power(qc: QuantumCircuit, q: int, k_mod8: int) -> None:
+    k = int(k_mod8) % 8
+    if k == 0:
+        return
+    if k == 1:
+        qc.t(q)
+    elif k == 2:
+        qc.s(q)
+    elif k == 3:
+        qc.s(q); qc.t(q)
+    elif k == 4:
+        qc.z(q)
+    elif k == 5:
+        qc.z(q); qc.t(q)
+    elif k == 6:
+        qc.sdg(q)
+    elif k == 7:
+        qc.tdg(q)
 
+def append_ccx_7t(qc: QuantumCircuit, a: int, b: int, t: int) -> None:
+    qc.h(t)
+    qc.cx(b, t)
+    qc.tdg(t)
+    qc.cx(a, t)
+    qc.t(t)
+    qc.cx(b, t)
+    qc.tdg(t)
+    qc.cx(a, t)
+    qc.t(b)
+    qc.t(t)
+    qc.h(t)
+    qc.cx(a, b)
+    qc.t(a)
+    qc.tdg(b)
+    qc.cx(a, b)
 
-def ffloat(x: Any, nd: int = 6) -> Any:
+def exact_ct_rebase(qc: QuantumCircuit) -> QuantumCircuit:
+    if not HAVE_QISKIT:
+        raise RuntimeError(f"Qiskit unavailable: {globals().get('QISKIT_IMPORT_ERROR')}")
+
+    out = QuantumCircuit(qc.num_qubits, name=f"{qc.name}_ct")
+    qmap = qid_map(qc)
+
+    for pos, inst in enumerate(qc.data):
+        name = inst.operation.name.lower()
+        qs = [qmap[q] for q in inst.qubits]
+        pars = list(getattr(inst.operation, "params", []))
+
+        if name == "barrier":
+            out.barrier(*qs)
+        elif name == "id":
+            out.id(qs[0])
+        elif name == "h":
+            out.h(qs[0])
+        elif name == "x":
+            out.x(qs[0])
+        elif name == "z":
+            out.z(qs[0])
+        elif name == "s":
+            out.s(qs[0])
+        elif name == "sdg":
+            out.sdg(qs[0])
+        elif name == "t":
+            out.t(qs[0])
+        elif name == "tdg":
+            out.tdg(qs[0])
+        elif name == "cx":
+            out.cx(qs[0], qs[1])
+
+        elif name in ("rz", "p", "u1"):
+            if len(qs) != 1 or not pars:
+                raise ValueError(f"Malformed {name} at position {pos}")
+            k = normalize_angle_pi_over_4(float(pars[0]))
+            append_phase_power(out, qs[0], k)
+
+        elif name == "rx":
+            if len(qs) != 1 or not pars:
+                raise ValueError(f"Malformed rx at position {pos}")
+            k = normalize_angle_pi_over_4(float(pars[0]))
+            out.h(qs[0])
+            append_phase_power(out, qs[0], k)
+            out.h(qs[0])
+
+        elif name == "ry":
+            if len(qs) != 1 or not pars:
+                raise ValueError(f"Malformed ry at position {pos}")
+            k = normalize_angle_pi_over_4(float(pars[0]))
+            out.sdg(qs[0])
+            out.h(qs[0])
+            append_phase_power(out, qs[0], k)
+            out.h(qs[0])
+            out.s(qs[0])
+
+        elif name == "cz":
+            out.h(qs[1])
+            out.cx(qs[0], qs[1])
+            out.h(qs[1])
+
+        elif name == "swap":
+            out.cx(qs[0], qs[1])
+            out.cx(qs[1], qs[0])
+            out.cx(qs[0], qs[1])
+
+        elif name == "ccx":
+            append_ccx_7t(out, qs[0], qs[1], qs[2])
+
+        else:
+            raise ValueError(
+                f"Unsupported gate for exact Clifford+T rebase: "
+                f"name={name!r}, position={pos}, qubits={qs}, params={pars}"
+            )
+
+    bad = []
+    for i, inst in enumerate(out.data):
+        nm = inst.operation.name.lower()
+        if nm not in ALLOWED_CT:
+            bad.append((i, nm))
+    if bad:
+        raise RuntimeError(f"Internal rebase error; non-CT gates remain: {bad[:20]}")
+    return out
+
+# =============================================================================
+# Projective equivalence checks
+# =============================================================================
+
+def matrices_equal_up_to_global_phase(a: np.ndarray, b: np.ndarray,
+                                      atol: float = MATRIX_ATOL) -> bool:
+    if a.shape != b.shape:
+        return False
+    fb = b.reshape(-1)
+    fa = a.reshape(-1)
+    idx = int(np.argmax(np.abs(fb)))
+    if abs(fb[idx]) < atol:
+        return np.allclose(a, b, atol=atol)
+    phase = fa[idx] / fb[idx]
+    if abs(phase) < atol:
+        return False
+    phase = phase / abs(phase)
+    return bool(np.allclose(a, phase * b, atol=atol, rtol=0))
+
+def operator_equiv_up_to_phase(a: QuantumCircuit, b: QuantumCircuit,
+                               max_qubits: int = MAX_OPERATOR_CHECK_QUBITS) -> Optional[bool]:
+    if a.num_qubits != b.num_qubits:
+        return False
+    if a.num_qubits > max_qubits:
+        return None
+    return matrices_equal_up_to_global_phase(Operator(a).data, Operator(b).data)
+
+def _parse_qcec_result(res) -> Tuple[Optional[bool], str]:
+    for attr in ("equivalent", "considered_equivalent", "equivalence", "result", "status"):
+        try:
+            if hasattr(res, attr):
+                val = getattr(res, attr)
+                if callable(val):
+                    val = val()
+                if isinstance(val, bool):
+                    return bool(val), f"mqt_qcec:{attr}"
+                s = str(val).lower()
+                if any(t in s for t in ("not_equiv", "not equivalent", "nonequivalent", "non_equiv", "false")):
+                    return False, f"mqt_qcec:{attr}:{s}"
+                if any(t in s for t in ("equivalent", "true")):
+                    return True, f"mqt_qcec:{attr}:{s}"
+        except Exception:
+            pass
+    return None, "qcec_unknown"
+
+def qcec_equiv(a: QuantumCircuit, b: QuantumCircuit) -> Tuple[Optional[bool], str]:
+    if not HAVE_QCEC:
+        return None, "qcec_unavailable"
     try:
-        if x is None or (isinstance(x, float) and math.isnan(x)):
-            return None
-        return round(float(x), nd)
-    except Exception:
-        return x
+        res = mqt_qcec.verify(a, b)
+        return _parse_qcec_result(res)
+    except Exception as e:
+        return None, f"qcec_error:{type(e).__name__}:{e}"
 
-# ---------------------------------------------------------------------------
-# Circuit generation
-# ---------------------------------------------------------------------------
+def statevector_equiv_guard(a: QuantumCircuit, b: QuantumCircuit,
+                            max_qubits: int = MAX_STATEVECTOR_QUBITS,
+                            seed: int = 0) -> Tuple[Optional[bool], str]:
+    if a.num_qubits != b.num_qubits:
+        return False, "different_num_qubits"
 
-def qaoa_ring(n: int, p: int, gamma: float = math.pi / 8, beta: float = math.pi / 8) -> QuantumCircuit:
-    qc = QuantumCircuit(n, name=f"qaoa_ring_n{n}_p{p}")
-    for i in range(n): qc.h(i)
-    for _ in range(p):
-        for i in range(n):
-            j = (i + 1) % n
-            qc.cx(i, j); qc.rz(2 * gamma, j); qc.cx(i, j)
-        for i in range(n): qc.rx(2 * beta, i)
-    return qc
+    n = a.num_qubits
+    if n <= MAX_OPERATOR_CHECK_QUBITS:
+        try:
+            ok = operator_equiv_up_to_phase(a, b, max_qubits=n)
+            return bool(ok), "operator_full"
+        except Exception as e:
+            return None, f"operator_error:{type(e).__name__}:{e}"
 
+    if n > max_qubits:
+        return None, "too_large_for_statevector_fallback"
 
-def qaoa_grid_2d(rows: int, cols: int, p: int, gamma: float = math.pi / 8, beta: float = math.pi / 8) -> QuantumCircuit:
-    n = rows * cols
-    qc = QuantumCircuit(n, name=f"qaoa_grid_{rows}x{cols}_p{p}")
-    def idx(r, c): return r * cols + c
-    for i in range(n): qc.h(i)
-    edges = []
-    for r in range(rows):
-        for c in range(cols):
-            if c + 1 < cols: edges.append((idx(r, c), idx(r, c + 1)))
-            if r + 1 < rows: edges.append((idx(r, c), idx(r + 1, c)))
-    for _ in range(p):
-        for i, j in edges:
-            qc.cx(i, j); qc.rz(2 * gamma, j); qc.cx(i, j)
-        for i in range(n): qc.rx(2 * beta, i)
-    return qc
-
-
-def qaoa_complete(n: int, p: int, gamma: float = math.pi / 8, beta: float = math.pi / 8) -> QuantumCircuit:
-    qc = QuantumCircuit(n, name=f"qaoa_complete_n{n}_p{p}")
-    for i in range(n): qc.h(i)
-    for _ in range(p):
-        for i in range(n):
-            for j in range(i + 1, n):
-                qc.cx(i, j); qc.rz(2 * gamma, j); qc.cx(i, j)
-        for i in range(n): qc.rx(2 * beta, i)
-    return qc
-
-
-def random_ct(n: int, depth: int, seed: int) -> QuantumCircuit:
     rnd = random.Random(seed)
-    qc = QuantumCircuit(n, name=f"random_ct_n{n}_d{depth}_s{seed}")
-    for layer in range(depth):
-        for q in range(n):
-            r = rnd.random()
-            if r < 0.25: qc.h(q)
-            elif r < 0.45: qc.s(q)
-            elif r < 0.70: qc.t(q)
-            elif r < 0.85: qc.tdg(q)
-            else: qc.rz(rnd.choice([math.pi/4, -math.pi/4, 3*math.pi/4, -3*math.pi/4]), q)
-        perm = list(range(n)); rnd.shuffle(perm)
-        for a, b in zip(perm[::2], perm[1::2]): qc.cx(a, b)
-    return qc
+    phase = None
+    try:
+        trials = min(16, 2**n)
+        for _ in range(trials):
+            bits = [rnd.randint(0, 1) for _ in range(n)]
+            init = Statevector.from_label("".join(map(str, reversed(bits))))
+            va = init.evolve(a).data
+            vb = init.evolve(b).data
+            idx = int(np.argmax(np.abs(vb)))
+            if abs(vb[idx]) < 1e-12:
+                if not np.allclose(va, vb, atol=1e-8):
+                    return False, "statevector_counterexample"
+                continue
+            ph = va[idx] / vb[idx]
+            if abs(ph) > 0:
+                ph /= abs(ph)
+            if phase is None:
+                phase = ph
+            if not np.allclose(va, phase * vb, atol=1e-8, rtol=0):
+                return False, "statevector_counterexample"
+        return None, "random_statevector_pass_not_proof"
+    except Exception as e:
+        return None, f"statevector_error:{type(e).__name__}:{e}"
 
+def equivalence_guard(original: QuantumCircuit, variant: QuantumCircuit,
+                      seed: int = 0) -> Tuple[str, str]:
+    qv, qm = qcec_equiv(original, variant)
+    if qv is True:
+        return "pass", qm
+    if qv is False:
+        return "fail", qm
 
-def random_interaction_ct(n: int, depth: int, seed: int, p_edge: float = 0.25) -> QuantumCircuit:
-    rnd = random.Random(seed)
-    qc = QuantumCircuit(n, name=f"random_interaction_ct_n{n}_d{depth}_s{seed}")
-    for layer in range(depth):
-        for q in range(n):
-            if rnd.random() < 0.65:
-                qc.rz(rnd.choice([math.pi/4, -math.pi/4, math.pi/2, -math.pi/2]), q)
-            elif rnd.random() < 0.5:
-                qc.h(q)
-        for i in range(n):
-            for j in range(i+1, n):
-                if rnd.random() < p_edge:
-                    qc.cx(i, j)
-    return qc
+    sv, sm = statevector_equiv_guard(original, variant, seed=seed)
+    if sv is True:
+        return "pass", sm
+    if sv is False:
+        return "fail", sm
+    return "unknown", f"{qm};{sm}"
 
+# =============================================================================
+# Binary symplectic Pauli model
+# =============================================================================
 
-def brickwork_ct(n: int, layers: int, seed: int = 0) -> QuantumCircuit:
-    rnd = random.Random(seed)
-    qc = QuantumCircuit(n, name=f"brickwork_ct_n{n}_l{layers}_s{seed}")
-    for l in range(layers):
-        start = l % 2
-        for i in range(start, n - 1, 2): qc.cx(i, i + 1)
-        for q in range(n):
-            qc.rz(rnd.choice([math.pi/4, -math.pi/4, 3*math.pi/4, -3*math.pi/4]), q)
-            if rnd.random() < 0.35: qc.h(q)
-    return qc
+@dataclass(frozen=True)
+class PauliSig:
+    x: Tuple[int, ...]
+    z: Tuple[int, ...]
 
+    @property
+    def n(self) -> int:
+        return len(self.x)
 
-def dense_phase(n: int, rounds: int = 1) -> QuantumCircuit:
-    qc = QuantumCircuit(n, name=f"dense_phase_n{n}_r{rounds}")
-    for _ in range(rounds):
-        for i in range(n): qc.h(i)
-        for i in range(n):
-            for j in range(i + 1, n):
-                qc.cx(i, j); qc.t(j); qc.cx(i, j)
-        for i in range(n): qc.h(i)
-    return qc
+    def vector(self) -> np.ndarray:
+        return np.array(self.x + self.z, dtype=np.uint8)
 
+    def label(self) -> str:
+        chars = []
+        for xi, zi in zip(self.x, self.z):
+            if xi == 0 and zi == 0:
+                chars.append("I")
+            elif xi == 1 and zi == 0:
+                chars.append("X")
+            elif xi == 0 and zi == 1:
+                chars.append("Z")
+            else:
+                chars.append("Y")
+        return "".join(chars)
 
-def qft_phase_like(n: int) -> QuantumCircuit:
-    # Clifford+T-like coarse discretized QFT-inspired phase ladder.
-    qc = QuantumCircuit(n, name=f"qft_phase_like_n{n}")
-    for i in range(n):
-        qc.h(i)
-        for j in range(i + 1, n):
-            # use pi/4 for T-like phases to keep the analysis in Clifford+T-like set
-            qc.cx(j, i); qc.rz(math.pi / 4, i); qc.cx(j, i)
-    return qc
+    @staticmethod
+    def from_vector(v: np.ndarray) -> "PauliSig":
+        v = np.asarray(v, dtype=np.uint8) % 2
+        n = len(v) // 2
+        return PauliSig(
+            tuple(int(x) for x in v[:n]),
+            tuple(int(z) for z in v[n:])
+        )
 
+def symplectic_product(a: PauliSig, b: PauliSig) -> int:
+    x1 = np.array(a.x, dtype=np.uint8)
+    z1 = np.array(a.z, dtype=np.uint8)
+    x2 = np.array(b.x, dtype=np.uint8)
+    z2 = np.array(b.z, dtype=np.uint8)
+    return int((int(x1 @ z2) + int(z1 @ x2)) % 2)
 
-def vqe_su2_bound(n: int, reps: int, seed: int = 0) -> QuantumCircuit:
-    qc = EfficientSU2(num_qubits=n, reps=reps, entanglement="linear")
-    # Bind to Clifford+T angles to make T-like detection meaningful.
-    params = sorted(qc.parameters, key=lambda p: p.name)
-    rnd = random.Random(seed)
-    choices = [0, math.pi/4, -math.pi/4, math.pi/2, -math.pi/2]
-    mapping = {p: rnd.choice(choices) for p in params}
-    out = qc.assign_parameters(mapping, inplace=False)
-    out.name = f"vqe_su2_n{n}_r{reps}_s{seed}"
-    return out
+def pauli_z(n: int, q: int) -> PauliSig:
+    x = [0] * n
+    z = [0] * n
+    z[q] = 1
+    return PauliSig(tuple(x), tuple(z))
 
+def gate_symplectic_matrix(n: int, name: str, qs: List[int]) -> np.ndarray:
+    name = name.lower()
 
-def real_amplitudes_bound(n: int, reps: int, seed: int = 0) -> QuantumCircuit:
-    qc = RealAmplitudes(num_qubits=n, reps=reps, entanglement="linear")
-    params = sorted(qc.parameters, key=lambda p: p.name)
-    rnd = random.Random(seed)
-    choices = [0, math.pi/4, -math.pi/4, math.pi/2, -math.pi/2]
-    out = qc.assign_parameters({p: rnd.choice(choices) for p in params}, inplace=False)
-    out.name = f"realamp_n{n}_r{reps}_s{seed}"
-    return out
+    def transform(v: np.ndarray) -> np.ndarray:
+        v = v.copy() % 2
+        x = v[:n].copy()
+        z = v[n:].copy()
 
+        if name == "h":
+            q = qs[0]
+            x[q], z[q] = z[q], x[q]
+        elif name in ("s", "sdg"):
+            q = qs[0]
+            z[q] ^= x[q]
+        elif name in ("x", "z", "id", "barrier"):
+            pass
+        elif name == "cx":
+            c, t = qs
+            x[t] ^= x[c]
+            z[c] ^= z[t]
+        else:
+            raise ValueError(f"Unsupported Clifford gate in suffix: {name}")
 
-def _get_or_make_ancilla_register(qc: QuantumCircuit, need: int, base: str = "anc") -> QuantumRegister:
-    """Return an existing ancilla register if it is large enough; otherwise create a uniquely named one.
+        return np.concatenate([x, z]).astype(np.uint8)
 
-    Qiskit does not allow two QuantumRegisters with the same name. The earlier v5 implementation
-    always tried to add QuantumRegister(..., "anc"), which fails for Grover-like circuits because
-    the oracle and diffuser both call _mcx on the same circuit.
-    """
-    need = max(1, int(need))
-    for qreg in qc.qregs:
-        if qreg.name.startswith(base) and len(qreg) >= need:
-            return qreg
-    existing = {qreg.name for qreg in qc.qregs}
-    name = base
-    idx = 0
-    while name in existing:
-        idx += 1
-        name = f"{base}_{idx}"
-    anc = QuantumRegister(need, name)
-    qc.add_register(anc)
-    return anc
-
-
-def _mcx(qc: QuantumCircuit, controls: List[int], target: int) -> None:
-    if len(controls) <= 4:
-        qc.mcx(controls, target)
-    else:
-        need = max(1, len(controls) - 2)
-        anc = _get_or_make_ancilla_register(qc, need)
-        qc.mcx(controls, target, ancilla_qubits=list(anc)[:need])
-
-
-def grover_like(n: int, iterations: int = 1) -> QuantumCircuit:
-    qc = QuantumCircuit(n, name=f"grover_like_n{n}_it{iterations}")
-    for i in range(n): qc.h(i)
-    for _ in range(iterations):
-        qc.h(n-1); _mcx(qc, list(range(n-1)), n-1); qc.h(n-1)
-        for i in range(n): qc.h(i); qc.x(i)
-        qc.h(n-1); _mcx(qc, list(range(n-1)), n-1); qc.h(n-1)
-        for i in range(n): qc.x(i); qc.h(i)
-    return qc
-
-
-def tof_chain(n: int) -> QuantumCircuit:
-    # Toffoli ladder, structured arithmetic-like non-Clifford structure.
-    qc = QuantumCircuit(n, name=f"tof_chain_n{n}")
-    for i in range(max(0, n - 2)):
-        qc.ccx(i, i+1, i+2)
-    for i in reversed(range(max(0, n - 2))):
-        qc.ccx(i, i+1, i+2)
-    return qc
-
-
-def phase_polynomial_stress(n: int, terms: int, seed: int) -> QuantumCircuit:
-    # Parity-phase circuit: compute random parity onto pivot, apply T-like phase, uncompute.
-    rnd = random.Random(seed)
-    qc = QuantumCircuit(n, name=f"phase_poly_n{n}_t{terms}_s{seed}")
-    for _ in range(terms):
-        subset = sorted(rnd.sample(range(n), rnd.randint(2, min(n, max(2, n//2 + 1)))))
-        pivot = subset[-1]
-        for q in subset[:-1]: qc.cx(q, pivot)
-        qc.rz(rnd.choice([math.pi/4, -math.pi/4, 3*math.pi/4, -3*math.pi/4]), pivot)
-        for q in reversed(subset[:-1]): qc.cx(q, pivot)
-    return qc
-
+    S = np.eye(2*n, dtype=np.uint8)
+    for j in range(2*n):
+        e = np.zeros(2*n, dtype=np.uint8)
+        e[j] = 1
+        S[:, j] = transform(e)
+    return S % 2
 
 @dataclass
-class BenchmarkSpec:
-    family: str
-    circuit_id: str
-    n: int  # physical qubit count in the constructed circuit
-    size_param: int  # logical/problem-size parameter when applicable
-    seed: int
-    circuit: Any
+class TEvent:
+    event_id: int
+    circuit_index: int
+    qubit: int
+    gate: str
+    sign: int
+    pauli: PauliSig
 
-    @property
-    def physical_qubits(self) -> int:
-        try:
-            return int(getattr(self.circuit, "num_qubits", self.n))
-        except Exception:
-            return int(self.n)
+def extract_pauli_events(ct: QuantumCircuit) -> List[TEvent]:
+    n = ct.num_qubits
+    qmap = qid_map(ct)
+    M = np.eye(2*n, dtype=np.uint8)
+    rev_events: List[TEvent] = []
+    data = list(ct.data)
 
-    @property
-    def logical_size(self) -> int:
-        try:
-            return int(self.size_param)
-        except Exception:
-            return int(self.n)
+    for idx in reversed(range(len(data))):
+        inst = data[idx]
+        name = inst.operation.name.lower()
+        qs = [qmap[q] for q in inst.qubits]
 
-
-
-def ripple_carry_toffoli_stress(n: int) -> QuantumCircuit:
-    """Small arithmetic-style benchmark: a reversible carry chain rich in CCX/T after Clifford+T decomposition."""
-    # Registers: a[0..n-1], b[0..n-1], carry[0..n]
-    qc = QuantumCircuit(2*n + n + 1, name=f"ripple_carry_toffoli_n{n}")
-    a = list(range(n)); b = list(range(n, 2*n)); c = list(range(2*n, 3*n+1))
-    for i in range(n):
-        qc.cx(a[i], b[i])
-        qc.ccx(a[i], b[i], c[i+1])
-        qc.cx(c[i], b[i])
-        if i + 1 < n:
-            qc.ccx(c[i+1], b[i], c[i+2])
-    # Partial uncompute to avoid a purely monotone chain while keeping arithmetic structure.
-    for i in reversed(range(max(0, n-1))):
-        qc.ccx(c[i+1], b[i], c[i+2])
-    return qc
-
-
-def controlled_phase_ladder(n: int, depth: int) -> QuantumCircuit:
-    """QFT/arithmetic-inspired controlled phase ladder with interleaved basis changes."""
-    qc = QuantumCircuit(n, name=f"controlled_phase_ladder_n{n}_d{depth}")
-    for q in range(n): qc.h(q)
-    for d in range(depth):
-        for i in range(n-1):
-            j = i + 1
-            qc.cx(i, j); qc.rz(((-1)**(i+d)) * math.pi/4, j); qc.cx(i, j)
-        if d % 2 == 0:
-            for q in range(0, n, 2): qc.h(q)
+        if name in ("t", "tdg"):
+            base = pauli_z(n, qs[0]).vector()
+            mapped = (M @ base) % 2
+            rev_events.append(
+                TEvent(
+                    event_id=-1,
+                    circuit_index=idx,
+                    qubit=qs[0],
+                    gate=name,
+                    sign=(+1 if name == "t" else -1),
+                    pauli=PauliSig.from_vector(mapped),
+                )
+            )
+        elif name in ALLOWED_CT:
+            if name == "barrier":
+                continue
+            if name in ("t", "tdg"):
+                raise AssertionError("unreachable")
+            Sg = gate_symplectic_matrix(n, name, qs)
+            M = (M @ Sg) % 2
         else:
-            for q in range(1, n, 2): qc.h(q)
-    return qc
+            raise ValueError(
+                f"extract_pauli_events requires exact CT basis; found {name} at {idx}"
+            )
+
+    events = list(reversed(rev_events))
+    return [
+        TEvent(
+            event_id=i,
+            circuit_index=e.circuit_index,
+            qubit=e.qubit,
+            gate=e.gate,
+            sign=e.sign,
+            pauli=e.pauli,
+        )
+        for i, e in enumerate(events)
+    ]
+
+def build_anticommutation_graph(events: List[TEvent]) -> Tuple[nx.Graph, pd.DataFrame]:
+    G = nx.Graph()
+
+    for e in events:
+        G.add_node(
+            e.event_id,
+            circuit_index=int(e.circuit_index),
+            qubit=int(e.qubit),
+            gate=e.gate,
+            sign=int(e.sign),
+            pauli=e.pauli.label(),
+        )
+
+    rows = []
+    for i in range(len(events)):
+        for j in range(i+1, len(events)):
+            a, b = events[i], events[j]
+            sp = symplectic_product(a.pauli, b.pauli)
+            if sp == 1:
+                G.add_edge(
+                    a.event_id, b.event_id,
+                    reason="pauli_anticommutation",
+                    symplectic_product=1,
+                )
+                rows.append({
+                    "u": a.event_id,
+                    "v": b.event_id,
+                    "u_pauli": a.pauli.label(),
+                    "v_pauli": b.pauli.label(),
+                    "symplectic_product": 1,
+                    "reason": "pauli_anticommutation",
+                })
+
+    return G, pd.DataFrame(rows, columns=EDGE_DF_COLUMNS)
 
 
-def random_cnot_t_layered(n: int, layers: int, seed: int) -> QuantumCircuit:
-    """Random Clifford+T benchmark closer to synthesis/optimization stress tests."""
-    rnd = random.Random(seed)
-    qc = QuantumCircuit(n, name=f"random_cnot_t_n{n}_l{layers}_s{seed}")
-    for l in range(layers):
-        qs = list(range(n)); rnd.shuffle(qs)
-        for q in qs:
-            if rnd.random() < 0.55:
-                qc.t(q) if rnd.random() < 0.7 else qc.tdg(q)
-            elif rnd.random() < 0.5:
-                qc.h(q)
-            else:
-                qc.s(q)
-        pairs = list(range(n)); rnd.shuffle(pairs)
-        for a,b in zip(pairs[::2], pairs[1::2]):
-            qc.cx(a,b)
-        if rnd.random() < 0.35 and n >= 3:
-            a,b,c = rnd.sample(range(n), 3)
-            qc.ccx(a,b,c)
-    return qc
+# =============================================================================
+# Independent direct-matrix validation of the Pauli model
+# =============================================================================
+
+_I2 = np.eye(2, dtype=complex)
+_X2 = np.array([[0, 1], [1, 0]], dtype=complex)
+_Y2 = np.array([[0, -1j], [1j, 0]], dtype=complex)
+_Z2 = np.array([[1, 0], [0, -1]], dtype=complex)
 
 
-
-def qaoa_from_edges(n: int, edges: Sequence[Tuple[int, int]], p: int, name: str,
-                    gamma: float = math.pi / 8, beta: float = math.pi / 8) -> QuantumCircuit:
-    """Generic QAOA-style phase separator for graph families used in modern benchmarks."""
-    qc = QuantumCircuit(n, name=f"{name}_n{n}_p{p}")
-    for i in range(n): qc.h(i)
-    clean_edges = [(int(a), int(b)) for a, b in edges if int(a) != int(b)]
-    for _ in range(p):
-        for i, j in clean_edges:
-            qc.cx(i, j); qc.rz(2 * gamma, j); qc.cx(i, j)
-        for i in range(n): qc.rx(2 * beta, i)
-    return qc
-
-
-def qaoa_path(n: int, p: int) -> QuantumCircuit:
-    return qaoa_from_edges(n, [(i, i+1) for i in range(n-1)], p, "qaoa_path")
-
-
-def qaoa_star(n: int, p: int) -> QuantumCircuit:
-    return qaoa_from_edges(n, [(0, i) for i in range(1, n)], p, "qaoa_star")
-
-
-def qaoa_random_regular(n: int, degree: int, p: int, seed: int) -> QuantumCircuit:
-    degree = min(degree, n-1)
-    if (n * degree) % 2 == 1:
-        degree = max(1, degree-1)
-    G = nx.random_regular_graph(degree, n, seed=seed) if n > degree and degree > 0 else nx.path_graph(n)
-    return qaoa_from_edges(n, list(G.edges()), p, f"qaoa_rr{degree}_s{seed}")
-
-
-def qaoa_erdos_renyi(n: int, p_edge: float, p: int, seed: int) -> QuantumCircuit:
-    G = nx.erdos_renyi_graph(n, p_edge, seed=seed)
-    if G.number_of_edges() == 0 and n > 1:
-        G.add_edges_from((i, i+1) for i in range(n-1))
-    return qaoa_from_edges(n, list(G.edges()), p, f"qaoa_er{str(p_edge).replace('.','p')}_s{seed}")
-
-
-def qaoa_barabasi_albert(n: int, m: int, p: int, seed: int) -> QuantumCircuit:
-    m = max(1, min(m, n-1))
-    G = nx.barabasi_albert_graph(n, m, seed=seed) if n > 2 else nx.path_graph(n)
-    return qaoa_from_edges(n, list(G.edges()), p, f"qaoa_ba{m}_s{seed}")
-
-
-def commuting_iqp(n: int, terms: int, seed: int) -> QuantumCircuit:
-    """IQP/diagonal commuting benchmark: important negative-control family."""
-    rnd = random.Random(seed)
-    qc = QuantumCircuit(n, name=f"iqp_commuting_n{n}_t{terms}_s{seed}")
-    for q in range(n): qc.h(q)
-    for _ in range(terms):
-        arity = rnd.choice([1, 2, 3]) if n >= 3 else rnd.choice([1, 2])
-        subset = sorted(rnd.sample(range(n), min(arity, n)))
-        if len(subset) == 1:
-            qc.rz(rnd.choice([math.pi/4, -math.pi/4]), subset[0])
-        else:
-            pivot = subset[-1]
-            for q in subset[:-1]: qc.cx(q, pivot)
-            qc.rz(rnd.choice([math.pi/4, -math.pi/4]), pivot)
-            for q in reversed(subset[:-1]): qc.cx(q, pivot)
-    for q in range(n): qc.h(q)
-    return qc
-
-
-def bv_oracle_like(n: int, seed: int) -> QuantumCircuit:
-    """Bernstein-Vazirani-like oracle with injected T-like phases to avoid all-Clifford triviality."""
-    rnd = random.Random(seed)
-    qc = QuantumCircuit(n+1, name=f"bv_phase_like_n{n}_s{seed}")
-    out = n
-    qc.x(out); qc.h(out)
-    for q in range(n): qc.h(q)
-    secret = [rnd.randint(0,1) for _ in range(n)]
-    if not any(secret): secret[0] = 1
-    for q,b in enumerate(secret):
-        if b:
-            qc.cx(q, out); qc.rz(math.pi/4, q); qc.cx(q, out)
-    for q in range(n): qc.h(q)
-    return qc
-
-
-def hardware_efficient_ct(n: int, reps: int, seed: int, entanglement: str = "linear") -> QuantumCircuit:
-    """Hardware-efficient ansatz with Clifford+T parameter binding."""
-    rnd = random.Random(seed)
-    qc = QuantumCircuit(n, name=f"hea_{entanglement}_n{n}_r{reps}_s{seed}")
-    choices = [0, math.pi/4, -math.pi/4, math.pi/2, -math.pi/2]
-    for r in range(reps):
-        for q in range(n):
-            qc.rx(rnd.choice(choices), q); qc.rz(rnd.choice(choices), q)
-        if entanglement == "circular":
-            for q in range(n): qc.cx(q, (q+1)%n)
-        elif entanglement == "full":
-            for i in range(n):
-                for j in range(i+1, n): qc.cx(i, j)
-        else:
-            for q in range(n-1): qc.cx(q, q+1)
-    return qc
-
-
-def modular_adder_proxy(n: int) -> QuantumCircuit:
-    """Arithmetic proxy with Toffoli/CNOT carry motifs; scalable but still generator-only."""
-    qc = QuantumCircuit(3*n + 2, name=f"modular_adder_proxy_n{n}")
-    a = list(range(n)); b = list(range(n, 2*n)); c = list(range(2*n, 3*n+2))
-    for i in range(n):
-        qc.ccx(a[i], b[i], c[i+1])
-        qc.cx(a[i], b[i])
-        qc.ccx(c[i], b[i], c[i+1])
-        qc.t(b[i]); qc.tdg(c[i+1])
-    for i in reversed(range(n)):
-        qc.ccx(c[i], b[i], c[i+1])
-        qc.cx(a[i], b[i])
-        qc.ccx(a[i], b[i], c[i+1])
-    return qc
-
-
-def multiplier_proxy(n: int) -> QuantumCircuit:
-    """Small multiplier-like Toffoli mesh; use cautiously for large n."""
-    qc = QuantumCircuit(3*n, name=f"multiplier_proxy_n{n}")
-    a = list(range(n)); b = list(range(n, 2*n)); acc = list(range(2*n, 3*n))
-    for i in range(n):
-        for j in range(n):
-            qc.ccx(a[i], b[j], acc[(i+j) % n])
-            if (i+j) % 2 == 0: qc.t(acc[(i+j) % n])
-    return qc
-
-
-def size_class_from_counts(n_qubits: int, t_count: Optional[int], ops: Optional[int] = None) -> str:
-    tc = int(t_count or 0); op = int(ops or 0)
-    if n_qubits <= 8 and tc < 100 and op < 1000: return "tiny"
-    if n_qubits <= 16 and tc < 500 and op < 5000: return "small"
-    if n_qubits <= 32 and tc < 3000 and op < 50000: return "medium"
-    return "large_proxy"
-
-
-def make_benchmarks(mode: str, seeds: Sequence[int], include_grover: bool = False,
-                    include_qaoa_p2_large: bool = False, max_qaoa_p2_n: int = 10,
-                    include_random_cnot_t_large: bool = False, max_random_cnot_t_n: int = 10,
-                    include_hea_large: bool = False, max_hea_n: int = 12,
-                    include_qaoa_rr_large: bool = False, max_qaoa_rr_n: int = 10) -> List[BenchmarkSpec]:
-    if not HAVE_QISKIT:
-        raise RuntimeError(f"Qiskit not available: {globals().get('QISKIT_IMPORT_ERROR','unknown')}")
-    specs: List[BenchmarkSpec] = []
-    seen = set()
-    def add(fam: str, cid: str, n: int, sp: int, seed: int, qc: QuantumCircuit):
-        sid = safe_name(cid)
-        key = (fam, sid, seed)
-        if key in seen: return
-        seen.add(key)
-        specs.append(BenchmarkSpec(fam, sid, n, sp, seed, qc))
-
-    if mode == "quick":
-        ns_small = [4, 5, 6]
-        for n in ns_small:
-            add("qaoa_ring", f"qaoa_ring_n{n}_p1", n, 1, 0, qaoa_ring(n, 1))
-            add("qaoa_path", f"qaoa_path_n{n}_p1", n, 1, 0, qaoa_path(n, 1))
-            add("qaoa_complete", f"qaoa_complete_n{n}_p1", n, 1, 0, qaoa_complete(n, 1))
-            add("dense_phase", f"dense_phase_n{n}_r1", n, 1, 0, dense_phase(n, 1))
-            add("brickwork_ct", f"brickwork_n{n}_l3", n, 3, 0, brickwork_ct(n, 3, 0))
-        for seed in seeds[:2]:
-            add("random_ct", f"random_ct_n6_d4_s{seed}", 6, 4, seed, random_ct(6, 4, seed))
-            add("phase_poly", f"phase_poly_n6_t8_s{seed}", 6, 8, seed, phase_polynomial_stress(6, 8, seed))
-            add("iqp_commuting", f"iqp_commuting_n6_t8_s{seed}", 6, 8, seed, commuting_iqp(6, 8, seed))
-            add("random_cnot_t", f"random_cnot_t_n6_l8_s{seed}", 6, 8, seed, random_cnot_t_layered(6, 8, seed))
-        return specs
-
-    if mode == "medium":
-        ns = [4, 6, 8, 10, 12, 14]
-        for n in ns:
-            pvals = [1, 2] if n <= max_qaoa_p2_n else [1]
-            for pval in pvals:
-                add("qaoa_ring", f"qaoa_ring_n{n}_p{pval}", n, pval, 0, qaoa_ring(n, pval))
-                add("qaoa_path", f"qaoa_path_n{n}_p{pval}", n, pval, 0, qaoa_path(n, pval))
-                add("qaoa_star", f"qaoa_star_n{n}_p{pval}", n, pval, 0, qaoa_star(n, pval))
-            if n <= 10: add("qaoa_complete", f"qaoa_complete_n{n}_p1", n, 1, 0, qaoa_complete(n, 1))
-            add("dense_phase", f"dense_phase_n{n}_r1", n, 1, 0, dense_phase(n, 1))
-            add("qft_phase_like", f"qft_phase_like_n{n}", n, n, 0, qft_phase_like(n))
-            add("controlled_phase_ladder", f"controlled_phase_ladder_n{n}_d2", n, 2, 0, controlled_phase_ladder(n, 2))
-            add("brickwork_ct", f"brickwork_n{n}_l4", n, 4, 0, brickwork_ct(n, 4, 0))
-            if include_hea_large or n <= max_hea_n:
-                add("hardware_efficient_linear", f"hea_linear_n{n}_r2", n, 2, 0, hardware_efficient_ct(n, 2, 0, "linear"))
-            if n <= 8:
-                add("vqe_su2", f"vqe_su2_n{n}_r2", n, 2, 0, vqe_su2_bound(n, 2, 0))
-                add("real_amplitudes", f"realamp_n{n}_r2", n, 2, 0, real_amplitudes_bound(n, 2, 0))
-            if include_grover and 5 <= n <= 10: add("grover_like", f"grover_like_n{n}_it1", n, 1, 0, grover_like(n, 1))
-            if n >= 5: add("tof_chain", f"tof_chain_n{n}", n, n, 0, tof_chain(n))
-            if n <= 10: add("modular_adder_proxy", f"modular_adder_proxy_n{n//2}", 3*(n//2)+2, n//2, 0, modular_adder_proxy(max(2,n//2)))
-        for seed in seeds:
-            for n in [6, 8, 10, 12, 14]:
-                add("qaoa_er", f"qaoa_er_n{n}_p1_s{seed}", n, 1, seed, qaoa_erdos_renyi(n, 0.25, 1, seed))
-                if include_qaoa_rr_large or n <= max_qaoa_rr_n:
-                    add("qaoa_rr", f"qaoa_rr_n{n}_d3_p1_s{seed}", n, 1, seed, qaoa_random_regular(n, 3, 1, seed))
-                add("qaoa_ba", f"qaoa_ba_n{n}_m2_p1_s{seed}", n, 1, seed, qaoa_barabasi_albert(n, 2, 1, seed))
-                add("random_ct", f"random_ct_n{n}_d6_s{seed}", n, 6, seed, random_ct(n, 6, seed))
-                add("random_interaction_ct", f"random_interaction_ct_n{n}_d4_s{seed}", n, 4, seed, random_interaction_ct(n, 4, seed, p_edge=0.20))
-                add("phase_poly", f"phase_poly_n{n}_t{2*n}_s{seed}", n, 2*n, seed, phase_polynomial_stress(n, 2*n, seed))
-                add("iqp_commuting", f"iqp_commuting_n{n}_t{2*n}_s{seed}", n, 2*n, seed, commuting_iqp(n, 2*n, seed))
-                if include_random_cnot_t_large or n <= max_random_cnot_t_n:
-                    add("random_cnot_t", f"random_cnot_t_n{n}_l{2*n}_s{seed}", n, 2*n, seed, random_cnot_t_layered(n, 2*n, seed))
-                add("bv_phase_like", f"bv_phase_like_n{n}_s{seed}", n+1, n, seed, bv_oracle_like(n, seed))
-        return specs
-
-    # larger generated benchmark suite
-    ns = [6, 8, 10, 12, 14, 16, 18, 20, 24]
-    for n in ns:
-        add("qaoa_ring", f"qaoa_ring_n{n}_p1", n, 1, 0, qaoa_ring(n, 1))
-        if include_qaoa_p2_large or n <= max_qaoa_p2_n:
-            add("qaoa_ring", f"qaoa_ring_n{n}_p2", n, 2, 0, qaoa_ring(n, 2))
-        add("qaoa_path", f"qaoa_path_n{n}_p1", n, 1, 0, qaoa_path(n, 1))
-        add("qaoa_star", f"qaoa_star_n{n}_p1", n, 1, 0, qaoa_star(n, 1))
-        if n <= 14: add("qaoa_complete", f"qaoa_complete_n{n}_p1", n, 1, 0, qaoa_complete(n, 1))
-        if n in [9, 16]:
-            r = int(math.sqrt(n)); add("qaoa_grid", f"qaoa_grid_{r}x{r}_p1", n, 1, 0, qaoa_grid_2d(r, r, 1))
-        add("dense_phase", f"dense_phase_n{n}_r1", n, 1, 0, dense_phase(n, 1))
-        add("qft_phase_like", f"qft_phase_like_n{n}", n, n, 0, qft_phase_like(n))
-        add("controlled_phase_ladder", f"controlled_phase_ladder_n{n}_d3", n, 3, 0, controlled_phase_ladder(n, 3))
-        add("brickwork_ct", f"brickwork_n{n}_l6", n, 6, 0, brickwork_ct(n, 6, 0))
-        if include_hea_large or n <= max_hea_n:
-            add("hardware_efficient_linear", f"hea_linear_n{n}_r3", n, 3, 0, hardware_efficient_ct(n, 3, 0, "linear"))
-        if n <= 12 and (include_hea_large or n <= max_hea_n): add("hardware_efficient_circular", f"hea_circular_n{n}_r2", n, 2, 0, hardware_efficient_ct(n, 2, 0, "circular"))
-        if include_grover and n <= 10: add("grover_like", f"grover_like_n{n}_it1", n, 1, 0, grover_like(n, 1))
-        add("tof_chain", f"tof_chain_n{n}", n, n, 0, tof_chain(n))
-        if n <= 16: add("modular_adder_proxy", f"modular_adder_proxy_n{max(2,n//2)}", 3*max(2,n//2)+2, max(2,n//2), 0, modular_adder_proxy(max(2,n//2)))
-        if n <= 10: add("multiplier_proxy", f"multiplier_proxy_n{max(2,n//3)}", 3*max(2,n//3), max(2,n//3), 0, multiplier_proxy(max(2,n//3)))
-    for seed in seeds:
-        for n in [8, 10, 12, 14, 16, 18, 20, 24]:
-            add("qaoa_er", f"qaoa_er_n{n}_p1_s{seed}", n, 1, seed, qaoa_erdos_renyi(n, 0.18, 1, seed))
-            if include_qaoa_rr_large or n <= max_qaoa_rr_n:
-                add("qaoa_rr", f"qaoa_rr_n{n}_d3_p1_s{seed}", n, 1, seed, qaoa_random_regular(n, 3, 1, seed))
-            add("qaoa_ba", f"qaoa_ba_n{n}_m2_p1_s{seed}", n, 1, seed, qaoa_barabasi_albert(n, 2, 1, seed))
-            add("random_ct", f"random_ct_n{n}_d8_s{seed}", n, 8, seed, random_ct(n, 8, seed))
-            add("random_interaction_ct", f"random_interaction_ct_n{n}_d6_s{seed}", n, 6, seed, random_interaction_ct(n, 6, seed, p_edge=0.16))
-            add("phase_poly", f"phase_poly_n{n}_t{3*n}_s{seed}", n, 3*n, seed, phase_polynomial_stress(n, 3*n, seed))
-            add("iqp_commuting", f"iqp_commuting_n{n}_t{3*n}_s{seed}", n, 3*n, seed, commuting_iqp(n, 3*n, seed))
-            if include_random_cnot_t_large or n <= max_random_cnot_t_n:
-                add("random_cnot_t", f"random_cnot_t_n{n}_l{3*n}_s{seed}", n, 3*n, seed, random_cnot_t_layered(n, 3*n, seed))
-            add("bv_phase_like", f"bv_phase_like_n{n}_s{seed}", n+1, n, seed, bv_oracle_like(n, seed))
-    return specs
-
-# ---------------------------------------------------------------------------
-# QASM and circuit helpers
-# ---------------------------------------------------------------------------
-
-def circuit_to_qasm(qc: QuantumCircuit) -> str:
-    """Export circuits using OpenQASM 2 only.
-
-    The pipeline avoids QASM3. The experiment is about ZX/SAT
-    representation sensitivity, not about optional QASM3 parser availability.
+def pauli_matrix_qiskit_order(p: PauliSig) -> np.ndarray:
     """
-    return circuit_to_qasm2_strict(qc)
-
-
-def circuit_from_qasm(txt: str) -> QuantumCircuit:
-    """Load OpenQASM 2 only. OpenQASM 3 inputs are skipped upstream."""
-    return circuit_from_qasm2_strict(txt)
-
-
-def circuit_to_qasm2_strict(qc: QuantumCircuit) -> str:
-    """Return OpenQASM 2 only. Used for PyZX/tket interoperability.
-
-    The publication experiments are not about QASM3 support. Several tool
-    chains still invoke optional QASM3 importers internally, which can make
-    normalisation appear to fail for environmental rather than mathematical
-    reasons. PyZX strategies therefore use this strict QASM2 path.
+    Matrix of an unsigned Pauli signature in Qiskit's little-endian qubit
+    convention.  p.x/p.z are stored q0-first, while Kronecker factors for an
+    n-qubit matrix are q_{n-1},...,q0.
     """
+    mats = []
+    for x, z in zip(reversed(p.x), reversed(p.z)):
+        if x == 0 and z == 0:
+            mats.append(_I2)
+        elif x == 1 and z == 0:
+            mats.append(_X2)
+        elif x == 0 and z == 1:
+            mats.append(_Z2)
+        else:
+            mats.append(_Y2)
+
+    M = np.array([[1.0 + 0.0j]])
+    for A in mats:
+        M = np.kron(M, A)
+    return M
+
+
+def single_qubit_pauli_on_n(n: int, q: int, which: str = "Z") -> np.ndarray:
+    if which.upper() == "Z":
+        p = pauli_z(n, q)
+    elif which.upper() == "X":
+        x = [0] * n; z = [0] * n; x[q] = 1
+        p = PauliSig(tuple(x), tuple(z))
+    else:
+        raise ValueError(which)
+    return pauli_matrix_qiskit_order(p)
+
+
+def _same_up_to_sign(A: np.ndarray, B: np.ndarray, atol: float = 1e-9) -> Tuple[bool, Optional[int]]:
+    if np.allclose(A, B, atol=atol, rtol=0):
+        return True, +1
+    if np.allclose(A, -B, atol=atol, rtol=0):
+        return True, -1
+    return False, None
+
+
+def _commutation_from_matrices(A: np.ndarray, B: np.ndarray, atol: float = 1e-9) -> Optional[int]:
+    """
+    Return 0 for commute, 1 for anticommute, None if neither relation is
+    numerically certified.
+    """
+    AB = A @ B
+    BA = B @ A
+    if np.allclose(AB, BA, atol=atol, rtol=0):
+        return 0
+    if np.allclose(AB, -BA, atol=atol, rtol=0):
+        return 1
+    return None
+
+
+def clifford_only_circuit(ct: QuantumCircuit,
+                          start_after_index: Optional[int] = None) -> QuantumCircuit:
+    """
+    Preserve the chronological order of all Clifford gates while deleting
+    explicit T/Tdg events.  If start_after_index is given, keep only Clifford
+    gates whose circuit index is strictly larger.
+    """
+    out = QuantumCircuit(ct.num_qubits)
+    qmap = qid_map(ct)
+
+    for idx, inst in enumerate(ct.data):
+        if start_after_index is not None and idx <= int(start_after_index):
+            continue
+
+        name = inst.operation.name.lower()
+        qs = [qmap[q] for q in inst.qubits]
+
+        if name in ("t", "tdg"):
+            continue
+        if name == "barrier":
+            continue
+        if name == "h":
+            out.h(qs[0])
+        elif name == "x":
+            out.x(qs[0])
+        elif name == "z":
+            out.z(qs[0])
+        elif name == "s":
+            out.s(qs[0])
+        elif name == "sdg":
+            out.sdg(qs[0])
+        elif name == "cx":
+            out.cx(qs[0], qs[1])
+        elif name == "id":
+            out.id(qs[0])
+        else:
+            raise ValueError(
+                f"clifford_only_circuit saw non-Clifford/unsupported gate {name}"
+            )
+    return out
+
+
+def direct_event_axis_matrix(ct: QuantumCircuit, event: TEvent) -> np.ndarray:
+    """
+    Independently compute the event axis:
+        P_i = C_suffix Z_q C_suffix^\\dagger,
+    where C_suffix contains all Clifford gates later in circuit time than the
+    explicit T/Tdg event, with all T/Tdg events omitted.
+
+    This is independent of the binary symplectic implementation and therefore
+    serves as a strong correctness cross-check.
+    """
+    suffix = clifford_only_circuit(ct, start_after_index=event.circuit_index)
+    U = Operator(suffix).data
+    Zq = single_qubit_pauli_on_n(ct.num_qubits, event.qubit, "Z")
+    return U @ Zq @ U.conj().T
+
+
+def validate_pauli_signatures_direct(ct: QuantumCircuit,
+                                     events: List[TEvent]) -> Dict[str, Any]:
+    """
+    Cross-check every binary symplectic Pauli signature against direct matrix
+    Clifford conjugation.  The Pauli sign is allowed to differ because the graph
+    intentionally works in the projective Pauli group P/{+/-I}.
+    """
+    if ct.num_qubits > MAX_DIRECT_PAULI_VALIDATION_QUBITS:
+        return {
+            "run": False,
+            "reason": f"n>{MAX_DIRECT_PAULI_VALIDATION_QUBITS}",
+            "all_signature_matches": None,
+            "all_pair_commutation_matches": None,
+        }
+
+    direct = {}
+    sign_rows = []
+
+    for e in events:
+        Pdir = direct_event_axis_matrix(ct, e)
+        Pbin = pauli_matrix_qiskit_order(e.pauli)
+        ok, axis_sign = _same_up_to_sign(Pdir, Pbin)
+        sign_rows.append({
+            "event_id": int(e.event_id),
+            "binary_pauli": e.pauli.label(),
+            "axis_match_up_to_sign": bool(ok),
+            "axis_sign_relative_to_binary": axis_sign,
+        })
+        if not ok:
+            return {
+                "run": True,
+                "all_signature_matches": False,
+                "all_pair_commutation_matches": False,
+                "event_checks": sign_rows,
+                "failure": f"event {e.event_id} direct axis != +/- binary axis",
+            }
+        direct[e.event_id] = Pdir
+
+    pair_rows = []
+    all_pairs = True
+    for i in range(len(events)):
+        for j in range(i + 1, len(events)):
+            a, b = events[i], events[j]
+            sp = symplectic_product(a.pauli, b.pauli)
+            dm = _commutation_from_matrices(direct[a.event_id], direct[b.event_id])
+            ok = (dm == sp)
+            all_pairs = all_pairs and ok
+            if SAVE_DIRECT_MATRIX_VALIDATION_DETAILS:
+                pair_rows.append({
+                    "u": int(a.event_id),
+                    "v": int(b.event_id),
+                    "symplectic_product": int(sp),
+                    "direct_matrix_relation": dm,
+                    "match": bool(ok),
+                })
+
+    return {
+        "run": True,
+        "all_signature_matches": True,
+        "all_pair_commutation_matches": bool(all_pairs),
+        "event_checks": sign_rows,
+        "pair_checks": pair_rows if SAVE_DIRECT_MATRIX_VALIDATION_DETAILS else None,
+    }
+
+
+def reconstruct_pauli_rotation_unitary(ct: QuantumCircuit,
+                                       events: List[TEvent]) -> Dict[str, Any]:
+    """
+    Independently reconstruct the CT circuit projectively as
+
+        U ~= R(P_m,theta_m) ... R(P_1,theta_1) C_final,
+
+    with P_i obtained by direct suffix-Clifford conjugation.
+
+    The direct axis matrix includes the +/- Pauli sign generated by Clifford
+    conjugation, so no hidden sign convention from the binary representation is
+    used in this check.
+    """
+    if ct.num_qubits > MAX_RECONSTRUCTION_QUBITS:
+        return {
+            "run": False,
+            "reason": f"n>{MAX_RECONSTRUCTION_QUBITS}",
+            "equivalent_up_to_global_phase": None,
+        }
+
+    final_cliff = clifford_only_circuit(ct)
+    Urec = Operator(final_cliff).data.astype(complex)
+    dim = Urec.shape[0]
+    I = np.eye(dim, dtype=complex)
+
+    # Events are in chronological circuit order.  Left-multiplication by each
+    # rotation yields R_m ... R_1 C_final after the loop.
+    for e in events:
+        P = direct_event_axis_matrix(ct, e)
+        theta = float(e.sign) * math.pi / 4.0
+        R = math.cos(theta / 2.0) * I - 1j * math.sin(theta / 2.0) * P
+        Urec = R @ Urec
+
+    Uct = Operator(ct).data
+    ok = matrices_equal_up_to_global_phase(Uct, Urec, atol=MATRIX_ATOL)
+    return {
+        "run": True,
+        "equivalent_up_to_global_phase": bool(ok),
+        "qubits": int(ct.num_qubits),
+        "events": int(len(events)),
+    }
+
+
+def deep_validate_pauli_model(ct: QuantumCircuit,
+                              events: List[TEvent],
+                              G: nx.Graph) -> Dict[str, Any]:
+    """
+    Reviewer-audit validation layer:
+      A) binary signatures vs direct conjugation,
+      B) symplectic relation vs direct matrix commutation,
+      C) complete Pauli-rotation reconstruction vs CT unitary,
+      D) graph edges exactly equal the symplectic-1 pairs.
+    """
+    expected_edges = {
+        (events[i].event_id, events[j].event_id)
+        for i in range(len(events))
+        for j in range(i + 1, len(events))
+        if symplectic_product(events[i].pauli, events[j].pauli) == 1
+    }
+    actual_edges = {tuple(sorted((int(u), int(v)))) for u, v in G.edges()}
+    graph_exact = (expected_edges == actual_edges)
+
+    sig = validate_pauli_signatures_direct(ct, events)
+    recon = reconstruct_pauli_rotation_unitary(ct, events)
+
+    return {
+        "graph_edges_exactly_symplectic_one_pairs": bool(graph_exact),
+        "direct_signature_validation": sig,
+        "projective_rotation_reconstruction": recon,
+        "pass": bool(
+            graph_exact
+            and (sig.get("all_signature_matches") in (True, None))
+            and (sig.get("all_pair_commutation_matches") in (True, None))
+            and (recon.get("equivalent_up_to_global_phase") in (True, None))
+        ),
+    }
+
+
+def maximum_clique_witness(G: nx.Graph) -> List[int]:
+    if G.number_of_nodes() == 0:
+        return []
+    best = max(nx.find_cliques(G), key=len, default=[])
+    return sorted(int(v) for v in best)
+
+
+def coloring_certificate(G: nx.Graph,
+                         chi: int,
+                         coloring: Dict[int, int]) -> Dict[str, Any]:
+    clique = maximum_clique_witness(G)
+    clique_size = len(clique)
+    return {
+        "chi": int(chi),
+        "proper_coloring_valid": bool(is_valid_coloring(G, coloring)),
+        "coloring": {str(int(v)): int(c) for v, c in coloring.items()},
+        "maximum_clique_witness": clique,
+        "clique_size": int(clique_size),
+        "hand_checkable_exact": bool(
+            is_valid_coloring(G, coloring) and clique_size == int(chi)
+        ),
+        "lower_bound_type": "explicit_clique" if clique_size == int(chi)
+                            else "exact_search/SAT",
+    }
+
+# =============================================================================
+# Exact coloring
+# =============================================================================
+
+def clique_lower_bound(G: nx.Graph) -> int:
+    if G.number_of_nodes() == 0:
+        return 0
+    return max((len(c) for c in nx.find_cliques(G)), default=1)
+
+def greedy_coloring_upper_bound(G: nx.Graph) -> Tuple[int, Dict[int, int]]:
+    if G.number_of_nodes() == 0:
+        return 0, {}
+    col = nx.coloring.greedy_color(G, strategy="saturation_largest_first")
+    return 1 + max(col.values(), default=-1), {int(v): int(c) for v, c in col.items()}
+
+def is_valid_coloring(G: nx.Graph, coloring: Dict[int, int]) -> bool:
+    if set(coloring) != set(G.nodes()):
+        return False
+    return all(coloring[u] != coloring[v] for u, v in G.edges())
+
+def exact_k_coloring_backtrack(G: nx.Graph, k: int) -> Optional[Dict[int, int]]:
+    nodes = list(G.nodes())
+    if not nodes:
+        return {}
+
+    color: Dict[int, int] = {}
+    neigh_colors: Dict[int, set] = {v: set() for v in nodes}
+
+    def choose_vertex() -> int:
+        uncolored = [v for v in nodes if v not in color]
+        return max(uncolored, key=lambda v: (len(neigh_colors[v]), G.degree(v)))
+
+    def rec() -> bool:
+        if len(color) == len(nodes):
+            return True
+        v = choose_vertex()
+        forbidden = {color[u] for u in G.neighbors(v) if u in color}
+
+        for c in range(k):
+            if c in forbidden:
+                continue
+            color[v] = c
+            changed = []
+            for u in G.neighbors(v):
+                if u not in color and c not in neigh_colors[u]:
+                    neigh_colors[u].add(c)
+                    changed.append(u)
+            if rec():
+                return True
+            for u in changed:
+                neigh_colors[u].remove(c)
+            del color[v]
+
+        return False
+
+    return dict(color) if rec() else None
+
+def exact_chromatic_backtracking(G: nx.Graph) -> Tuple[int, Dict[int, int]]:
+    if G.number_of_nodes() == 0:
+        return 0, {}
+
+    lb = max(1, clique_lower_bound(G))
+    ub, _ = greedy_coloring_upper_bound(G)
+
+    for k in range(lb, ub + 1):
+        sol = exact_k_coloring_backtrack(G, k)
+        if sol is not None:
+            if not is_valid_coloring(G, sol):
+                raise AssertionError("Invalid exact coloring")
+            return k, sol
+
+    raise RuntimeError("Exact coloring search failed")
+
+def sat_k_colorable(G: nx.Graph, k: int) -> Tuple[bool, Dict[int, int], Dict[str, Any]]:
+    """
+    Exact k-colorability query with explicit encoding and solver-performance stats.
+
+    CNF:
+      - at least one color per vertex,
+      - at most one color per vertex,
+      - adjacent vertices cannot share a color.
+    """
+    if not HAVE_PYSAT:
+        raise RuntimeError("python-sat unavailable")
+
+    t0 = time.perf_counter()
+
+    if G.number_of_nodes() == 0:
+        return True, {}, {
+            "k":int(k), "variables":0, "clauses":0,
+            "encoding_runtime_s":0.0, "solver_runtime_s":0.0,
+            "solver_stats":{}
+        }
+
+    cnf = CNF()
+    var: Dict[Tuple[int, int], int] = {}
+
+    def vv(v: int, c: int) -> int:
+        key = (int(v), int(c))
+        if key not in var:
+            var[key] = len(var) + 1
+        return var[key]
+
+    for v in G.nodes():
+        cnf.append([vv(v, c) for c in range(k)])
+        for c1 in range(k):
+            for c2 in range(c1+1, k):
+                cnf.append([-vv(v, c1), -vv(v, c2)])
+
+    for u, v in G.edges():
+        for c in range(k):
+            cnf.append([-vv(u, c), -vv(v, c)])
+
+    t1 = time.perf_counter()
+    with Minisat22(bootstrap_with=cnf.clauses) as solver:
+        ts = time.perf_counter()
+        ok = bool(solver.solve())
+        te = time.perf_counter()
+        try:
+            solver_stats = dict(solver.accum_stats())
+        except Exception:
+            solver_stats = {}
+        model_raw = solver.get_model() if ok else None
+
+    stats = {
+        "k":int(k),
+        "variables":int(len(var)),
+        "clauses":int(len(cnf.clauses)),
+        "encoding_runtime_s":float(t1-t0),
+        "solver_runtime_s":float(te-ts),
+        "total_query_runtime_s":float(te-t0),
+        "solver_stats":solver_stats,
+    }
+
+    if not ok:
+        return False, {}, stats
+
+    model = set(x for x in (model_raw or []) if x > 0)
+    col = {}
+    for v in G.nodes():
+        for c in range(k):
+            if vv(v, c) in model:
+                col[int(v)] = int(c)
+                break
+
+    return True, col, stats
+
+def exact_chromatic_with_crosscheck(G: nx.Graph) -> Tuple[int, Dict[int, int], Dict[str, Any]]:
+    tb0 = time.perf_counter()
+    chi, col = exact_chromatic_backtracking(G)
+    tb1 = time.perf_counter()
+
+    report = {
+        "backtracking_chi": int(chi),
+        "backtracking_valid": bool(is_valid_coloring(G, col)),
+        "backtracking_runtime_s":float(tb1-tb0),
+        "sat_available": bool(HAVE_PYSAT),
+        "sat_crosscheck": False,
+        "sat_match": None,
+        "sat_calls":0,
+        "sat_total_runtime_s":0.0,
+        "sat_queries":[],
+    }
+
+    if USE_SAT_CROSSCHECK and HAVE_PYSAT:
+        report["sat_crosscheck"] = True
+        ok, scol, st = sat_k_colorable(G, chi)
+        report["sat_calls"] += 1
+        report["sat_total_runtime_s"] += float(st.get("total_query_runtime_s",0.0))
+        report["sat_queries"].append(st)
+
+        if not ok or not is_valid_coloring(G, scol):
+            raise AssertionError("SAT disagrees with exact backtracking coloring")
+
+        for k in range(max(1, clique_lower_bound(G)), chi):
+            ok_small, _, st_small = sat_k_colorable(G, k)
+            report["sat_calls"] += 1
+            report["sat_total_runtime_s"] += float(st_small.get("total_query_runtime_s",0.0))
+            report["sat_queries"].append(st_small)
+            if ok_small:
+                raise AssertionError(
+                    f"SAT found coloring below exact chi: {k} < {chi}"
+                )
+        report["sat_match"] = True
+
+    # Convenient headline stats for the chi-colorability encoding.
+    chi_query = next(
+        (q for q in report["sat_queries"] if int(q.get("k",-1)) == int(chi)),
+        None
+    )
+    report["sat_chi_variables"] = (
+        int(chi_query["variables"]) if chi_query is not None else None
+    )
+    report["sat_chi_clauses"] = (
+        int(chi_query["clauses"]) if chi_query is not None else None
+    )
+
+    return chi, col, report
+
+def validate_color_classes_commute(events: List[TEvent],
+                                   coloring: Dict[int, int]) -> bool:
+    by_id = {e.event_id: e for e in events}
+    groups: Dict[int, List[int]] = {}
+
+    for v, c in coloring.items():
+        groups.setdefault(int(c), []).append(int(v))
+
+    for members in groups.values():
+        for i in range(len(members)):
+            for j in range(i+1, len(members)):
+                if symplectic_product(
+                    by_id[members[i]].pauli,
+                    by_id[members[j]].pauli
+                ) == 1:
+                    return False
+
+    return True
+
+# =============================================================================
+# Exact graph-isomorphism classification
+# =============================================================================
+
+def graph_prefilter_key(G: nx.Graph) -> Tuple:
+    deg = tuple(sorted(d for _, d in G.degree()))
+    return (
+        G.number_of_nodes(),
+        G.number_of_edges(),
+        deg,
+        nx.number_connected_components(G) if G.number_of_nodes() else 0,
+    )
+
+def exact_graph_classes(graphs: List[Tuple[str, nx.Graph]]) -> Dict[str, int]:
+    """
+    Assign exact isomorphism class IDs.
+    Hash/invariants are used only as prefilters; final decision is nx.is_isomorphic.
+    """
+    classes: List[Tuple[Tuple, nx.Graph]] = []
+    mapping: Dict[str, int] = {}
+
+    for key, G in graphs:
+        pf = graph_prefilter_key(G)
+        found = None
+
+        for cid, (cpf, rep) in enumerate(classes):
+            if pf != cpf:
+                continue
+            if nx.is_isomorphic(G, rep):
+                found = cid
+                break
+
+        if found is None:
+            found = len(classes)
+            classes.append((pf, G.copy()))
+
+        mapping[key] = int(found)
+
+    return mapping
+
+# =============================================================================
+# Normalization strategies -- V8.1 corrected
+# =============================================================================
+
+@dataclass
+class NormResult:
+    strategy: str
+    tool: str
+    success: bool
+    qc: Optional[QuantumCircuit]
+    trace: Dict[str, Any]
+    error: Optional[str] = None
+
+
+# Keep Qiskit normalization inside a declared surface basis.
+# This avoids optimization levels silently emitting U2/U3/generic unitary gates,
+# which made the V8 pilot impossible to rebase exactly even though the original
+# circuits were generated on the pi/4 grid.
+QISKIT_NORM_BASIS = [
+    "h", "x", "z", "s", "sdg", "t", "tdg",
+    "cx", "ccx", "rz", "rx", "ry"
+]
+
+
+def qiskit_basis_preserving_transpile(qc: QuantumCircuit, opt: int) -> QuantumCircuit:
+    """Qiskit compiler baseline with an explicit, publication-auditable basis."""
+    try:
+        return transpile(
+            qc,
+            basis_gates=QISKIT_NORM_BASIS,
+            optimization_level=int(opt),
+        )
+    except Exception:
+        # One decomposition attempt is allowed, but still fail closed if the
+        # requested basis cannot be reached.
+        dec = qc.decompose(reps=10)
+        return transpile(
+            dec,
+            basis_gates=QISKIT_NORM_BASIS,
+            optimization_level=int(opt),
+        )
+
+
+def qiskit_strategy(name: str, opt: int):
+    def run(qc: QuantumCircuit, seed: int) -> NormResult:
+        try:
+            out = qiskit_basis_preserving_transpile(qc, opt)
+            bad = sorted(set(
+                inst.operation.name.lower()
+                for inst in out.data
+                if inst.operation.name.lower() not in set(QISKIT_NORM_BASIS)
+            ))
+            if bad:
+                raise RuntimeError(f"Qiskit normalization left undeclared gates: {bad}")
+
+            return NormResult(
+                strategy=name,
+                tool="qiskit",
+                success=True,
+                qc=out,
+                trace={
+                    "tool":"qiskit",
+                    "optimization_level":opt,
+                    "basis":QISKIT_NORM_BASIS,
+                    "output_gate_hist":gate_histogram(out),
+                },
+            )
+        except Exception as e:
+            return NormResult(
+                strategy=name,
+                tool="qiskit",
+                success=False,
+                qc=None,
+                trace={
+                    "tool":"qiskit",
+                    "optimization_level":opt,
+                    "basis":QISKIT_NORM_BASIS,
+                    "failure_stage":"qiskit_basis_preserving_transpile",
+                    "traceback":traceback.format_exc()[-3000:],
+                },
+                error=repr(e),
+            )
+    run.strategy_name = name
+    return run
+
+
+def circuit_to_qasm2(qc: QuantumCircuit) -> str:
     if qasm2_dumps is not None:
         return qasm2_dumps(qc)
-    # Older Qiskit exposes QuantumCircuit.qasm(); keep as fallback.
     if hasattr(qc, "qasm"):
         return qc.qasm()
-    raise RuntimeError("QASM2 export unavailable; install qiskit with qasm2 support")
+    raise RuntimeError("OpenQASM 2 export unavailable")
 
 
 def sanitize_qasm2_text(txt: str) -> str:
-    """Normalize PyZX-produced OpenQASM into a conservative OpenQASM 2 string.
-
-    This function deliberately does not support OpenQASM 3.  The normalisation
-    sensitivity experiments should not depend on QASM3 optional importers.
     """
-    t = str(txt or "")
-    # PyZX normally emits QASM2, but some versions omit qelib1 include.
-    if "OPENQASM 3" in t:
-        raise RuntimeError("QASM3 text encountered on strict QASM2 path")
-    if "OPENQASM 2" not in t.splitlines()[:3]:
-        t = "OPENQASM 2.0;\n" + t
-    if 'include "qelib1.inc";' not in t and 'include "stdgates.inc";' not in t:
-        lines = t.splitlines()
-        # insert after OPENQASM header
+    Conservative PyZX -> Qiskit OpenQASM 2 sanitation.
+
+    V8 pilot diagnosis showed that a large fraction of otherwise successful
+    PyZX extractions failed only because PyZX emitted `swap` while the strict
+    QASM2 parser did not have that symbol in scope.  Expand SWAP exactly into
+    three CNOTs.  No scientific transformation is hidden here: this is only an
+    exact serialization bridge.
+    """
+    s = str(txt or "")
+
+    if "OPENQASM 3" in s:
+        raise RuntimeError("QASM3 encountered on strict QASM2 path")
+
+    if "OPENQASM 2" not in "\n".join(s.splitlines()[:3]):
+        s = "OPENQASM 2.0;\n" + s
+
+    if 'include "qelib1.inc";' not in s:
+        lines = s.splitlines()
         inserted = False
         for i, line in enumerate(lines):
             if line.strip().startswith("OPENQASM 2"):
@@ -898,307 +1345,362 @@ def sanitize_qasm2_text(txt: str) -> str:
                 break
         if not inserted:
             lines.insert(0, 'include "qelib1.inc";')
-        t = "\n".join(lines)
+        s = "\n".join(lines)
 
-    # PyZX sometimes emits `swap a,b;` in otherwise OpenQASM 2 text.
-    # Qiskit's strict qasm2 loader may reject it depending on the included
-    # basis/library.  Expand SWAP into three CNOTs before parsing.  This is
-    # semantics-preserving and only affects serialization, not the analysis
-    # logic.  Handles both `swap q[0],q[1];` and whitespace variants.
     def _expand_swap(m):
         a = m.group(1).strip()
         b = m.group(2).strip()
         return f"cx {a},{b};\ncx {b},{a};\ncx {a},{b};"
-    t = re.sub(r"(?im)^\s*swap\s+([^,;]+)\s*,\s*([^;]+?)\s*;\s*$", _expand_swap, t)
 
-    # Some PyZX/QASM writers emit `phase(...)` or `u1(...)`; qelib1 supports
-    # u1 but not always phase in strict loaders.  Keep this conservative.
-    t = re.sub(r"(?i)\bphase\s*\(", "u1(", t)
-    return t
+    s = re.sub(
+        r"(?im)^\s*swap\s+([^,;]+)\s*,\s*([^;]+?)\s*;\s*$",
+        _expand_swap,
+        s
+    )
+
+    # Compatibility with PyZX writers that use `phase(...)`.
+    s = re.sub(r"(?i)\bphase\s*\(", "u1(", s)
+    return s
 
 
-def circuit_from_qasm2_strict(txt: str) -> QuantumCircuit:
-    """Load OpenQASM 2 only. Used for outputs produced by PyZX.
-
-    Important: this function never calls QuantumCircuit.from_qasm_str because
-    recent Qiskit versions may internally route that helper through the optional
-    qiskit-qasm3-import package.  For the publication run we want PyZX failures
-    to be genuine extraction/normalisation failures, not QASM3 environment noise.
-    """
-    t = sanitize_qasm2_text(txt)
+def circuit_from_qasm2(txt: str) -> QuantumCircuit:
     if qasm2_loads is None:
-        raise RuntimeError("QASM2 loader unavailable; cannot use strict PyZX path")
-    return qasm2_loads(t)
+        raise RuntimeError("OpenQASM 2 loader unavailable")
+    return qasm2_loads(sanitize_qasm2_text(txt))
 
 
-def save_qasm(qc: QuantumCircuit, path: str | Path) -> None:
-    text_write(path, circuit_to_qasm(qc))
+def _graph_size(g) -> Dict[str, int]:
+    return {
+        "vertices": int(g.num_vertices()),
+        "edges": int(g.num_edges()),
+    }
 
 
-def transpile_ct(qc: QuantumCircuit, opt: int = 1) -> QuantumCircuit:
-    basis = ["h", "x", "z", "s", "sdg", "t", "tdg", "cx", "ccx", "rz", "rx", "ry"]
+def _returned_graph_or_same(ret, g):
+    """PyZX API compatibility: some routines mutate, some return a graph."""
+    if ret is not None and hasattr(ret, "num_vertices") and hasattr(ret, "num_edges"):
+        return ret
+    return g
+
+
+def pyzx_common_graphlike_preprocess(g, ops: List[str]):
+    """
+    Apply the SAME mandatory graph-like preparation to every PyZX branch.
+
+    This is not counted as a strategy-specific simplification.  It defines the
+    common starting representation from which `no_simp`, pivot, lcomp, full
+    reduce, etc. are compared.
+
+    V8 diagnosis:
+      no_simp / pivot_only / lcomp_only / teleport_reduce all failed because
+      extraction requires a graph-like ZX diagram.  The corrected design makes
+      graph-like conversion an explicit common preprocessing stage.
+    """
+    fn = getattr(zx.simplify, "to_graph_like", None)
+    if fn is None:
+        raise RuntimeError(
+            "Installed PyZX has no zx.simplify.to_graph_like; "
+            "cannot create a scientifically comparable common graph-like baseline."
+        )
+
+    before = _graph_size(g)
+    ret = fn(g)
+    g = _returned_graph_or_same(ret, g)
+    after = _graph_size(g)
+
+    ops.append("common_preprocess:to_graph_like")
+    return g, before, after
+
+
+def _apply_pyzx_strategy(g, mode: str, rnd: random.Random,
+                         repeat: int, ops: List[str]):
+    """Apply only the strategy-specific part AFTER common graph-like preparation."""
+    for _ in range(max(1, int(repeat))):
+        if mode == "none":
+            ops.append("strategy:none")
+            continue
+
+        if mode == "full_reduce":
+            zx.simplify.full_reduce(g)
+            ops.append("strategy:full_reduce")
+            continue
+
+        if mode == "clifford_simp":
+            zx.simplify.clifford_simp(g)
+            ops.append("strategy:clifford_simp")
+            continue
+
+        if mode == "teleport_reduce":
+            ret = zx.simplify.teleport_reduce(g)
+            g = _returned_graph_or_same(ret, g)
+            ops.append("strategy:teleport_reduce")
+            continue
+
+        if mode == "pivot_only":
+            zx.simplify.pivot_simp(g)
+            ops.append("strategy:pivot_simp")
+            continue
+
+        if mode == "lcomp_only":
+            zx.simplify.lcomp_simp(g)
+            ops.append("strategy:lcomp_simp")
+            continue
+
+        if mode == "random_mix":
+            choices = ["pivot", "lcomp", "clifford"]
+            # More than one draw is needed for an actual trajectory.
+            for _j in range(4):
+                r = rnd.choice(choices)
+                if r == "pivot":
+                    zx.simplify.pivot_simp(g)
+                    ops.append("strategy_random:pivot_simp")
+                elif r == "lcomp":
+                    zx.simplify.lcomp_simp(g)
+                    ops.append("strategy_random:lcomp_simp")
+                else:
+                    zx.simplify.clifford_simp(g)
+                    ops.append("strategy_random:clifford_simp")
+            continue
+
+        raise ValueError(f"Unknown PyZX mode: {mode}")
+
+    return g
+
+
+def _pyzx_extract_to_qiskit(g, ops: List[str]) -> QuantumCircuit:
+    """
+    Exact extraction + robust QASM2 conversion.
+
+    Direct to_qiskit methods are attempted when present; otherwise the QASM2
+    route is used.  The QASM2 route expands SWAP exactly.
+    """
     try:
-        return transpile(qc, basis_gates=basis, optimization_level=opt)
-    except Exception:
+        c2 = zx.extract.extract_circuit(g.copy())
+        ops.append("extraction:extract_circuit")
+    except Exception as e:
+        raise RuntimeError(f"PyZX extraction failed: {type(e).__name__}: {e}") from e
+
+    errors = []
+
+    # API-dependent direct routes.
+    try:
+        basic = c2.to_basic_gates()
+        if hasattr(basic, "to_qiskit"):
+            out = basic.to_qiskit()
+            ops.append("conversion:to_basic_gates_to_qiskit")
+            return out
+    except Exception as e:
+        errors.append(f"basic_to_qiskit:{type(e).__name__}:{e}")
+
+    try:
+        if hasattr(c2, "to_qiskit"):
+            out = c2.to_qiskit()
+            ops.append("conversion:to_qiskit")
+            return out
+    except Exception as e:
+        errors.append(f"to_qiskit:{type(e).__name__}:{e}")
+
+    try:
+        qasm = sanitize_qasm2_text(c2.to_qasm())
+        out = circuit_from_qasm2(qasm)
+        ops.append("conversion:qasm2_sanitized")
+        return out
+    except Exception as e:
+        errors.append(f"qasm2_sanitized:{type(e).__name__}:{e}")
+
+    raise RuntimeError("PyZX-to-Qiskit conversion failed: " + " | ".join(errors))
+
+
+def pyzx_strategy(name: str, mode: str, repeat: int = 1,
+                  fixed_random_seed: Optional[int] = None):
+    """
+    Corrected PyZX strategy.
+
+    fixed_random_seed is part of the STRATEGY definition.  V8 accidentally used
+    only the benchmark seed inside all random-mix functions, so strategies named
+    random_mix_s0/s1/s2 could execute the same random trajectory.  V8.1 fixes
+    this and records the effective RNG seed.
+    """
+    def run(qc: QuantumCircuit, seed: int) -> NormResult:
+        if not HAVE_PYZX:
+            return NormResult(
+                strategy=name,
+                tool="pyzx",
+                success=False,
+                qc=None,
+                trace={"tool":"pyzx", "mode":mode, "failure_stage":"import"},
+                error=f"PyZX unavailable: {globals().get('PYZX_IMPORT_ERROR')}",
+            )
+
+        trace: Dict[str, Any] = {
+            "tool":"pyzx",
+            "mode":mode,
+            "strategy_random_seed":fixed_random_seed,
+        }
+        ops: List[str] = []
+
         try:
-            return transpile(qc, optimization_level=opt)
-        except Exception:
-            return qc.copy()
+            # Stable circuit-specific RNG component plus fixed strategy seed.
+            if fixed_random_seed is None:
+                effective_seed = int(seed)
+            else:
+                name_digest = int(
+                    hashlib.sha256(str(qc.name).encode("utf-8")).hexdigest()[:8],
+                    16
+                )
+                effective_seed = (
+                    1000003 * int(fixed_random_seed)
+                    + 9176 * int(seed)
+                    + name_digest
+                ) & 0xFFFFFFFF
+
+            trace["effective_random_seed"] = int(effective_seed)
+            rnd = random.Random(effective_seed)
+
+            trace["failure_stage"] = "qiskit_to_pyzx"
+            c = zx.Circuit.from_qasm(circuit_to_qasm2(qc))
+
+            trace["failure_stage"] = "circuit_to_graph"
+            g = c.to_graph()
+            trace["raw_graph"] = _graph_size(g)
+
+            trace["failure_stage"] = "common_graphlike_preprocess"
+            g, common_before, common_after = pyzx_common_graphlike_preprocess(g, ops)
+            trace["common_graphlike_before"] = common_before
+            trace["common_graphlike_after"] = common_after
+
+            trace["strategy_input_graph"] = _graph_size(g)
+
+            trace["failure_stage"] = "strategy_specific_rewrite"
+            g = _apply_pyzx_strategy(
+                g=g,
+                mode=mode,
+                rnd=rnd,
+                repeat=repeat,
+                ops=ops,
+            )
+            trace["strategy_output_graph"] = _graph_size(g)
+
+            trace["failure_stage"] = "extraction_conversion"
+            out = _pyzx_extract_to_qiskit(g, ops)
+
+            # Put all PyZX outputs onto the SAME declared surface gate vocabulary
+            # before equivalence/rebase.  opt=0: no additional optimization.
+            trace["failure_stage"] = "post_extraction_surface_basis"
+            out = qiskit_basis_preserving_transpile(out, 0)
+
+            trace["ops"] = ops
+            trace["output_gate_hist"] = gate_histogram(out)
+            trace["failure_stage"] = "none"
+
+            return NormResult(
+                strategy=name,
+                tool="pyzx",
+                success=True,
+                qc=out,
+                trace=trace,
+            )
+
+        except Exception as e:
+            trace["ops"] = ops
+            trace["traceback"] = traceback.format_exc()[-4000:]
+            return NormResult(
+                strategy=name,
+                tool="pyzx",
+                success=False,
+                qc=None,
+                trace=trace,
+                error=repr(e),
+            )
+
+    run.strategy_name = name
+    return run
 
 
-def gate_histogram(qc: QuantumCircuit) -> Dict[str, int]:
-    c = Counter()
-    for inst in qc.data:
-        c[inst.operation.name.lower()] += 1
-    return dict(sorted(c.items()))
-
-
-def qid_map(qc: QuantumCircuit) -> Dict[Any, int]:
-    return {q: i for i, q in enumerate(qc.qubits)}
-
-
-def angle_to_tlike(angle: float, tol: float = ANGLE_TOL_DEFAULT) -> Optional[str]:
-    # Only odd multiples of pi/4 are counted as T-like. pi/2 is Clifford S-like.
-    a = ((float(angle) + math.pi) % (2 * math.pi)) - math.pi
-    k = int(round(a / (math.pi / 4)))
-    if abs(a - k * (math.pi / 4)) <= tol and (k % 2 != 0):
-        return "t" if (k % 8) in (1, 5) else "tdg"
-    return None
-
-
-def t_nodes(qc: QuantumCircuit, tol: float = ANGLE_TOL_DEFAULT) -> List[Tuple[int, str, List[int]]]:
-    qmap = qid_map(qc)
-    out = []
-    for idx, inst in enumerate(qc.data):
-        name = inst.operation.name.lower()
-        qs = [qmap[q] for q in inst.qubits]
-        if name in T_NAMES:
-            out.append((idx, name, qs))
-        elif name in ("rz", "p", "u1"):
+def select_tket_pass():
+    if not HAVE_TKET:
+        return None, None
+    for name in [
+        "FullPeepholeOptimise",
+        "PeepholeOptimise",
+        "CliffordSimp",
+        "SynthesiseTket",
+        "SynthesiseTK",
+    ]:
+        cls = getattr(_tket_passes, name, None)
+        if cls is not None:
             try:
-                lab = angle_to_tlike(float(inst.operation.params[0]), tol=tol)
-                if lab is not None:
-                    out.append((idx, lab, qs))
+                return name, cls()
             except Exception:
                 pass
-    return out
+    return None, None
 
 
-def naive_tdepth(qc: QuantumCircuit, tol: float = ANGLE_TOL_DEFAULT) -> int:
-    qmap = qid_map(qc)
-    last: Dict[int, int] = defaultdict(int)
-    d = 0
-    for inst in qc.data:
-        name = inst.operation.name.lower()
-        is_t = name in T_NAMES
-        if not is_t and name in ("rz", "p", "u1"):
-            try: is_t = angle_to_tlike(float(inst.operation.params[0]), tol=tol) is not None
-            except Exception: is_t = False
-        if is_t:
-            qs = [qmap[q] for q in inst.qubits]
-            layer = 1 + max([last[q] for q in qs] or [0])
-            for q in qs: last[q] = layer
-            d = max(d, layer)
-    return int(d)
-
-
-def controls_target(name: str, qids: List[int]) -> Tuple[List[int], Optional[int]]:
-    if name in ("cx", "cy", "cz") and len(qids) >= 2:
-        return [qids[0]], qids[1]
-    if name in ("ccx", "ccz", "mcx", "mcx_gray", "mcx_recursive") and len(qids) >= 2:
-        return qids[:-1], qids[-1]
-    return [], None
-
-
-# ---------------------------------------------------------------------------
-# Normalization strategies
-# ---------------------------------------------------------------------------
-
-@dataclass
-class NormResult:
-    strategy: str
-    success: bool
-    qc: Optional[Any]
-    error: Optional[str] = None
-    trace: Optional[Dict[str, Any]] = None
-
-
-def qiskit_strategy(name: str, opt: int) -> Callable[[QuantumCircuit, int], NormResult]:
-    def fn(qc: QuantumCircuit, seed: int) -> NormResult:
-        try:
-            out = transpile_ct(qc, opt=opt)
-            out.name = f"{qc.name}_{name}"
-            return NormResult(name, True, out, trace={"tool":"qiskit", "optimization_level": opt})
-        except Exception as e:
-            return NormResult(name, False, None, error=str(e), trace={"tool":"qiskit", "optimization_level": opt})
-    setattr(fn, "strategy_name", name)
-    return fn
-
-
-def pyzx_strategy(name: str, mode: str, repeat: int = 1) -> Callable[[QuantumCircuit, int], NormResult]:
-    def fn(qc: QuantumCircuit, seed: int) -> NormResult:
-        if not HAVE_PYZX:
-            return NormResult(name, False, None, error="PyZX unavailable", trace={"tool":"pyzx", "mode":mode})
-        try:
-            qasm = circuit_to_qasm2_strict(qc)
-            c = zx.Circuit.from_qasm(qasm)
-            g = c.to_graph()
-            pre = {"vertices": int(g.num_vertices()), "edges": int(g.num_edges())}
-            ops = []
-            rnd = random.Random(seed)
-            # PyZX simplification calls are version-dependent; try conservative sequences.
-            for _ in range(max(1, repeat)):
-                if mode == "none":
-                    pass
-                elif mode == "full_reduce":
-                    zx.simplify.full_reduce(g); ops.append("full_reduce")
-                elif mode == "clifford_simp":
-                    try: zx.simplify.clifford_simp(g); ops.append("clifford_simp")
-                    except Exception:
-                        zx.simplify.full_reduce(g); ops.append("fallback_full_reduce")
-                elif mode == "teleport_reduce":
-                    try:
-                        zx.simplify.teleport_reduce(g); ops.append("teleport_reduce")
-                    except Exception:
-                        zx.simplify.full_reduce(g); ops.append("fallback_full_reduce")
-                elif mode == "pivot_only":
-                    try: zx.simplify.pivot_simp(g); ops.append("pivot_simp")
-                    except Exception: pass
-                elif mode == "lcomp_only":
-                    try: zx.simplify.lcomp_simp(g); ops.append("lcomp_simp")
-                    except Exception: pass
-                elif mode == "random_mix":
-                    choices = ["pivot", "lcomp", "clifford"]
-                    for _j in range(3):
-                        r = rnd.choice(choices)
-                        try:
-                            if r == "pivot": zx.simplify.pivot_simp(g); ops.append("pivot_simp")
-                            elif r == "lcomp": zx.simplify.lcomp_simp(g); ops.append("lcomp_simp")
-                            else: zx.simplify.clifford_simp(g); ops.append("clifford_simp")
-                        except Exception as ee:
-                            ops.append(f"{r}_failed:{type(ee).__name__}")
-                else:
-                    zx.simplify.full_reduce(g); ops.append("default_full_reduce")
-            post = {"vertices": int(g.num_vertices()), "edges": int(g.num_edges())}
-            try:
-                c2 = zx.extract.extract_circuit(g.copy())
-            except Exception:
-                c2 = zx.Circuit.from_graph(g.copy()) if hasattr(zx.Circuit, "from_graph") else None
-            if c2 is None:
-                raise RuntimeError("PyZX extraction failed")
-            out = None
-            conversion_errors = []
-            # Prefer direct PyZX -> Qiskit conversion if available; it avoids all QASM importers.
-            for conv_name, conv in [
-                ("to_basic_gates_to_qiskit", lambda cc: cc.to_basic_gates().to_qiskit()),
-                ("to_qiskit", lambda cc: cc.to_qiskit()),
-            ]:
-                try:
-                    out = conv(c2)
-                    ops.append(f"conversion:{conv_name}")
-                    break
-                except Exception as ce:
-                    conversion_errors.append(f"{conv_name}:{type(ce).__name__}:{ce}")
-            if out is None:
-                try:
-                    qasm2 = c2.to_qasm()
-                    qasm2 = sanitize_qasm2_text(qasm2)
-                    out = circuit_from_qasm2_strict(qasm2)
-                    ops.append("conversion:qasm2_strict")
-                except Exception as ce:
-                    conversion_errors.append(f"qasm2_strict:{type(ce).__name__}:{ce}")
-                    raise RuntimeError("PyZX-to-Qiskit conversion failed without QASM3 path: " + " | ".join(conversion_errors))
-            out = transpile_ct(out, opt=0)
-            out.name = f"{qc.name}_{name}"
-            return NormResult(name, True, out, trace={"tool":"pyzx", "mode":mode, "ops":ops, "pre":pre, "post":post})
-        except Exception as e:
-            return NormResult(name, False, None, error=repr(e), trace={"tool":"pyzx", "mode":mode, "traceback": traceback.format_exc()[-2000:]})
-    setattr(fn, "strategy_name", name)
-    return fn
-
-
-def tket_strategy(name: str) -> Callable[[QuantumCircuit, int], NormResult]:
-    def fn(qc: QuantumCircuit, seed: int) -> NormResult:
+def tket_strategy(name: str):
+    def run(qc: QuantumCircuit, seed: int) -> NormResult:
         if not HAVE_TKET:
-            return NormResult(name, False, None, error="tket unavailable", trace={"tool":"tket", "import_error": TKET_IMPORT_ERROR})
+            return NormResult(
+                strategy=name, tool="tket", success=False, qc=None,
+                trace={"tool":"tket", "failure_stage":"import"},
+                error=f"tket unavailable: {globals().get('TKET_IMPORT_ERROR')}"
+            )
         try:
             tk = qiskit_to_tk(qc)
-            pass_name, pass_obj = _select_tket_pass()
-            if pass_obj is not None:
-                pass_obj.apply(tk)
-            else:
-                pass_name = "conversion_only"
-            
-            # pytket may leave implicit wire swaps/permutations after optimization.
-            # Make them explicit before conversion where supported, then request
-            # replace_implicit_swaps=True on newer pytket-qiskit versions.
+            pname, pobj = select_tket_pass()
+            if pobj is not None:
+                pobj.apply(tk)
+
             try:
                 if hasattr(tk, "replace_implicit_wire_swaps"):
                     tk.replace_implicit_wire_swaps()
             except Exception:
                 pass
+
             try:
                 out = tk_to_qiskit(tk, replace_implicit_swaps=True)
             except TypeError:
                 out = tk_to_qiskit(tk)
-            out = transpile_ct(out, opt=0)
-            out.name = f"{qc.name}_{name}"
-            return NormResult(name, True, out, trace={"tool":"tket", "pass":pass_name, "available_passes": TKET_AVAILABLE_PASSES[:80]})
+
+            out = qiskit_basis_preserving_transpile(out, 0)
+
+            return NormResult(
+                strategy=name,
+                tool="tket",
+                success=True,
+                qc=out,
+                trace={
+                    "tool":"tket",
+                    "pass":pname or "conversion_only",
+                    "output_gate_hist":gate_histogram(out),
+                }
+            )
         except Exception as e:
-            return NormResult(name, False, None, error=repr(e), trace={"tool":"tket", "available_passes": TKET_AVAILABLE_PASSES[:80], "traceback": traceback.format_exc()[-2000:]})
-    setattr(fn, "strategy_name", name)
-    return fn
+            return NormResult(
+                strategy=name, tool="tket", success=False, qc=None,
+                trace={
+                    "tool":"tket",
+                    "failure_stage":"tket_normalization_or_conversion",
+                    "traceback":traceback.format_exc()[-3000:]
+                },
+                error=repr(e)
+            )
+    run.strategy_name = name
+    return run
 
 
-def failure_category(strategy: str, error: Optional[str], trace: Optional[Dict[str, Any]] = None) -> str:
-    """Classify failures explicitly for summary health reports."""
-    e = (error or "").lower()
-    st = (strategy or "").lower()
-    if not e:
-        return "none"
-    if "timeout" in e or "timeoutexpired" in e:
-        return "timeout"
-    if "qiskit_qasm3_import" in e or "qasm3" in e or "qasm" in e:
-        return "serialization_failed"
-    if "unavailable" in e or "not installed" in e or "missingoptional" in e:
-        return "optional_backend_missing"
-    if "tket unavailable" in e or ("tket" in st and "unavailable" in e):
-        return "optional_backend_missing"
-    if "extract" in e or "from_graph" in e:
-        return "extraction_failed"
-    if "pyzx" in st or "simpl" in e or "pivot" in e or "lcomp" in e:
-        return "normalization_failed"
-    return "analysis_failed"
+def build_strategies():
+    strategies = []
 
+    if INCLUDE_QISKIT_BASELINES:
+        strategies += [
+            qiskit_strategy("qiskit_opt0", 0),
+            qiskit_strategy("qiskit_opt1", 1),
+            qiskit_strategy("qiskit_opt2", 2),
+            qiskit_strategy("qiskit_opt3", 3),
+        ]
 
-def draw_dependency_graph_safe(G: nx.Graph, path: Path, max_nodes: int = 120) -> None:
-    """Small visual artifact for counterexample inspection."""
-    if not HAVE_MPL or G.number_of_nodes() > max_nodes:
-        return
-    try:
-        ensure_dir(path.parent)
-        fig = plt.figure(figsize=(5.5, 4.2))
-        pos = nx.spring_layout(G, seed=42) if G.number_of_nodes() > 0 else {}
-        nx.draw_networkx_nodes(G, pos, node_size=160)
-        nx.draw_networkx_edges(G, pos, width=0.8, alpha=0.7)
-        nx.draw_networkx_labels(G, pos, font_size=7)
-        plt.axis("off")
-        plt.tight_layout()
-        fig.savefig(path, dpi=180)
-        plt.close(fig)
-    except Exception:
-        try:
-            plt.close("all")
-        except Exception:
-            pass
-
-
-def build_strategies(random_rewrite_seeds: Sequence[int], enable_tket: bool = False) -> List[Callable[[QuantumCircuit, int], NormResult]]:
-    strategies = [
-        qiskit_strategy("qiskit_opt0", 0),
-        qiskit_strategy("qiskit_opt1", 1),
-        qiskit_strategy("qiskit_opt2", 2),
-        qiskit_strategy("qiskit_opt3", 3),
+    # Primary ZX analysis.
+    strategies += [
         pyzx_strategy("pyzx_no_simp", "none"),
         pyzx_strategy("pyzx_full_reduce", "full_reduce"),
         pyzx_strategy("pyzx_clifford_simp", "clifford_simp"),
@@ -1206,2020 +1708,3063 @@ def build_strategies(random_rewrite_seeds: Sequence[int], enable_tket: bool = Fa
         pyzx_strategy("pyzx_pivot_only", "pivot_only"),
         pyzx_strategy("pyzx_lcomp_only", "lcomp_only"),
     ]
-    # tket is scientifically useful as an external compiler-normalization
-    # baseline, but V7.1 makes it explicit. This avoids silent 0%-success
-    # strategy rows when pytket is not available in the active environment.
-    if enable_tket:
-        if HAVE_TKET:
-            pass_name, _pass_obj = _select_tket_pass()
-            print(f"[tket] enabled; selected pass: {pass_name or 'conversion_only'}")
-            strategies.append(tket_strategy("tket_compiler_norm"))
-        else:
-            print(f"[tket] --enable-tket was requested, but import failed: {TKET_IMPORT_ERROR}")
-    for s in random_rewrite_seeds:
-        strategies.append(pyzx_strategy(f"pyzx_random_mix_s{s}", "random_mix", repeat=2))
+
+    # Random seeds now genuinely define distinct strategy trajectories.
+    for s in PYZX_RANDOM_SEEDS:
+        strategies.append(
+            pyzx_strategy(
+                f"pyzx_random_mix_s{s}",
+                "random_mix",
+                repeat=2,
+                fixed_random_seed=int(s),
+            )
+        )
+
+    if INCLUDE_TKET:
+        strategies.append(tket_strategy("tket_compiler_norm"))
+
     return strategies
 
-# ---------------------------------------------------------------------------
-# Dependency graph and provenance
-# ---------------------------------------------------------------------------
+# =============================================================================
+# Publication-scale balanced benchmark suite: 22 families x 10 circuits
+# =============================================================================
+
+def qaoa_from_edges(n: int, edges: Sequence[Tuple[int,int]], p: int,
+                    name: str, gamma: float = math.pi/8,
+                    beta: float = math.pi/8) -> QuantumCircuit:
+    qc = QuantumCircuit(n, name=f"{name}_n{n}_p{p}")
+    for q in range(n): qc.h(q)
+    for _ in range(int(p)):
+        for i,j in [(int(a),int(b)) for a,b in edges if int(a)!=int(b)]:
+            qc.cx(i,j); qc.rz(2*gamma,j); qc.cx(i,j)
+        for q in range(n): qc.rx(2*beta,q)
+    return qc
+
+def qaoa_path(n,p=1): return qaoa_from_edges(n,[(i,i+1) for i in range(n-1)],p,'qaoa_path')
+def qaoa_ring(n,p=1): return qaoa_from_edges(n,[(i,(i+1)%n) for i in range(n)],p,'qaoa_ring')
+def qaoa_star(n,p=1): return qaoa_from_edges(n,[(0,i) for i in range(1,n)],p,'qaoa_star')
+def qaoa_complete(n,p=1): return qaoa_from_edges(n,[(i,j) for i in range(n) for j in range(i+1,n)],p,'qaoa_complete')
+
+def qaoa_erdos_renyi(n,p_edge,p,seed):
+    G=nx.erdos_renyi_graph(n,p_edge,seed=seed)
+    if G.number_of_edges()==0 and n>1: G.add_edges_from((i,i+1) for i in range(n-1))
+    return qaoa_from_edges(n,list(G.edges()),p,f'qaoa_er_s{seed}')
+
+def qaoa_barabasi_albert(n,m,p,seed):
+    G=nx.barabasi_albert_graph(n,max(1,min(int(m),n-1)),seed=seed)
+    return qaoa_from_edges(n,list(G.edges()),p,f'qaoa_ba_s{seed}')
+
+def qaoa_random_regular(n,degree,p,seed):
+    d=min(int(degree),n-1)
+    if (n*d)%2: d=max(1,d-1)
+    G=nx.random_regular_graph(d,n,seed=seed)
+    return qaoa_from_edges(n,list(G.edges()),p,f'qaoa_rr_s{seed}')
+
+def random_ct(n,depth,seed):
+    rnd=random.Random(seed); qc=QuantumCircuit(n,name=f'random_ct_n{n}_d{depth}_s{seed}')
+    for _ in range(depth):
+        for q in range(n):
+            r=rnd.random()
+            if r<.25: qc.h(q)
+            elif r<.45: qc.s(q)
+            elif r<.70: qc.t(q)
+            elif r<.85: qc.tdg(q)
+            else: qc.rz(rnd.choice([math.pi/4,-math.pi/4,3*math.pi/4,-3*math.pi/4]),q)
+        perm=list(range(n)); rnd.shuffle(perm)
+        for a,b in zip(perm[::2],perm[1::2]): qc.cx(a,b)
+    return qc
+
+def random_interaction_ct(n,depth,seed,p_edge=.25):
+    rnd=random.Random(seed); qc=QuantumCircuit(n,name=f'random_interaction_ct_n{n}_d{depth}_s{seed}')
+    for _ in range(depth):
+        for q in range(n):
+            r=rnd.random()
+            if r<.55: qc.rz(rnd.choice([math.pi/4,-math.pi/4,math.pi/2,-math.pi/2]),q)
+            elif r<.75: qc.h(q)
+            elif r<.90: qc.rx(rnd.choice([math.pi/4,-math.pi/4,math.pi/2]),q)
+        for i in range(n):
+            for j in range(i+1,n):
+                if rnd.random()<p_edge: qc.cx(i,j)
+    return qc
+
+def random_cnot_t_layered(n,layers,seed):
+    rnd=random.Random(seed); qc=QuantumCircuit(n,name=f'random_cnot_t_n{n}_l{layers}_s{seed}')
+    for _ in range(layers):
+        qs=list(range(n)); rnd.shuffle(qs)
+        for q in qs:
+            r=rnd.random()
+            if r<.50: qc.t(q)
+            elif r<.68: qc.tdg(q)
+            elif r<.84: qc.h(q)
+            else: qc.s(q)
+        pairs=list(range(n)); rnd.shuffle(pairs)
+        for a,b in zip(pairs[::2],pairs[1::2]): qc.cx(a,b)
+        if rnd.random()<.25 and n>=3:
+            a,b,c=rnd.sample(range(n),3); qc.ccx(a,b,c)
+    return qc
+
+def brickwork_ct(n,layers,seed):
+    rnd=random.Random(seed); qc=QuantumCircuit(n,name=f'brickwork_n{n}_l{layers}_s{seed}')
+    for l in range(layers):
+        for i in range(l%2,n-1,2): qc.cx(i,i+1)
+        for q in range(n):
+            qc.rz(rnd.choice([math.pi/4,-math.pi/4,3*math.pi/4,-3*math.pi/4]),q)
+            if rnd.random()<.35: qc.h(q)
+    return qc
+
+def dense_phase(n,rounds=1):
+    qc=QuantumCircuit(n,name=f'dense_phase_n{n}_r{rounds}')
+    for _ in range(rounds):
+        for q in range(n): qc.h(q)
+        for i in range(n):
+            for j in range(i+1,n): qc.cx(i,j); qc.t(j); qc.cx(i,j)
+        for q in range(n): qc.h(q)
+    return qc
+
+def qft_phase_like(n):
+    qc=QuantumCircuit(n,name=f'qft_phase_like_n{n}')
+    for i in range(n):
+        qc.h(i)
+        for j in range(i+1,n): qc.cx(j,i); qc.rz(math.pi/4,i); qc.cx(j,i)
+    return qc
+
+def controlled_phase_ladder(n,depth):
+    qc=QuantumCircuit(n,name=f'controlled_phase_ladder_n{n}_d{depth}')
+    for q in range(n): qc.h(q)
+    for d in range(depth):
+        for i in range(n-1): qc.cx(i,i+1); qc.rz(((-1)**(i+d))*math.pi/4,i+1); qc.cx(i,i+1)
+        for q in (range(0,n,2) if d%2==0 else range(1,n,2)): qc.h(q)
+    return qc
+
+def phase_polynomial_stress(n,terms,seed):
+    rnd=random.Random(seed); qc=QuantumCircuit(n,name=f'phase_poly_n{n}_t{terms}_s{seed}')
+    for _ in range(terms):
+        subset=sorted(rnd.sample(range(n),rnd.randint(2,min(n,max(2,n//2+1)))))
+        pivot=subset[-1]
+        for q in subset[:-1]: qc.cx(q,pivot)
+        qc.rz(rnd.choice([math.pi/4,-math.pi/4,3*math.pi/4,-3*math.pi/4]),pivot)
+        for q in reversed(subset[:-1]): qc.cx(q,pivot)
+    return qc
+
+def commuting_iqp(n,terms,seed):
+    rnd=random.Random(seed); qc=QuantumCircuit(n,name=f'iqp_commuting_n{n}_t{terms}_s{seed}')
+    for q in range(n): qc.h(q)
+    for _ in range(terms):
+        arity=rnd.choice([1,2,3]) if n>=3 else rnd.choice([1,2]); subset=sorted(rnd.sample(range(n),min(arity,n)))
+        if len(subset)==1: qc.rz(rnd.choice([math.pi/4,-math.pi/4]),subset[0])
+        else:
+            pivot=subset[-1]
+            for q in subset[:-1]: qc.cx(q,pivot)
+            qc.rz(rnd.choice([math.pi/4,-math.pi/4]),pivot)
+            for q in reversed(subset[:-1]): qc.cx(q,pivot)
+    for q in range(n): qc.h(q)
+    return qc
+
+def bv_oracle_like(n,seed):
+    rnd=random.Random(seed); qc=QuantumCircuit(n+1,name=f'bv_phase_like_n{n}_s{seed}'); out=n
+    qc.x(out); qc.h(out)
+    for q in range(n): qc.h(q)
+    secret=[rnd.randint(0,1) for _ in range(n)]
+    if not any(secret): secret[0]=1
+    for q,b in enumerate(secret):
+        if b: qc.cx(q,out); qc.rz(math.pi/4,q); qc.cx(q,out)
+    for q in range(n): qc.h(q)
+    return qc
+
+def tof_chain(n):
+    qc=QuantumCircuit(n,name=f'tof_chain_n{n}')
+    for i in range(max(0,n-2)): qc.ccx(i,i+1,i+2)
+    for i in reversed(range(max(0,n-2))): qc.ccx(i,i+1,i+2)
+    return qc
+
+def modular_adder_proxy(n):
+    qc=QuantumCircuit(3*n+2,name=f'modular_adder_proxy_n{n}'); a=list(range(n)); b=list(range(n,2*n)); c=list(range(2*n,3*n+2))
+    for i in range(n): qc.ccx(a[i],b[i],c[i+1]); qc.cx(a[i],b[i]); qc.ccx(c[i],b[i],c[i+1]); qc.t(b[i]); qc.tdg(c[i+1])
+    for i in reversed(range(n)): qc.ccx(c[i],b[i],c[i+1]); qc.cx(a[i],b[i]); qc.ccx(a[i],b[i],c[i+1])
+    return qc
+
+def hardware_efficient_ct(n,reps,seed,entanglement='linear'):
+    rnd=random.Random(seed); qc=QuantumCircuit(n,name=f'hea_{entanglement}_n{n}_r{reps}_s{seed}'); choices=[0,math.pi/4,-math.pi/4,math.pi/2,-math.pi/2]
+    for _ in range(reps):
+        for q in range(n): qc.rx(rnd.choice(choices),q); qc.rz(rnd.choice(choices),q)
+        if entanglement=='circular':
+            for q in range(n): qc.cx(q,(q+1)%n)
+        elif entanglement=='full':
+            for i in range(n):
+                for j in range(i+1,n): qc.cx(i,j)
+        else:
+            for q in range(n-1): qc.cx(q,q+1)
+    return qc
+
+def real_amplitudes_ct(n,reps,seed):
+    rnd=random.Random(seed); qc=QuantumCircuit(n,name=f'realamp_n{n}_r{reps}_s{seed}'); choices=[0,math.pi/4,-math.pi/4,math.pi/2,-math.pi/2]
+    for _ in range(reps):
+        for q in range(n): qc.ry(rnd.choice(choices),q)
+        for q in range(n-1): qc.cx(q,q+1)
+    for q in range(n): qc.ry(rnd.choice(choices),q)
+    return qc
+
+def vqe_su2_ct(n,reps,seed):
+    rnd=random.Random(seed); qc=QuantumCircuit(n,name=f'vqe_su2_n{n}_r{reps}_s{seed}'); choices=[0,math.pi/4,-math.pi/4,math.pi/2,-math.pi/2]
+    for _ in range(reps):
+        for q in range(n): qc.ry(rnd.choice(choices),q); qc.rz(rnd.choice(choices),q)
+        for q in range(n-1): qc.cx(q,q+1)
+    return qc
+
+def k4_motif_ct(repetitions,seed):
+    rnd=random.Random(seed); qc=QuantumCircuit(4,name=f'k4_motif_r{repetitions}_s{seed}'); edges=[(0,1),(0,2),(0,3),(1,2),(1,3),(2,3)]
+    for q in range(4): qc.h(q)
+    for _ in range(repetitions):
+        for a,b in edges: qc.cx(a,b); qc.rz(rnd.choice([math.pi/4,-math.pi/4]),b); qc.cx(a,b)
+        for q in range(4):
+            if rnd.random()<.5: qc.h(q)
+    return qc
 
 @dataclass
-class EdgeRecord:
-    u: int
-    v: int
-    reason: str
-    blocker: str
-    blocker_index: int
-    shared_qubit: int
+class Benchmark:
+    family: str
+    circuit_id: str
+    qc: QuantumCircuit
+    seed: int
 
+def make_publication_benchmarks() -> List[Benchmark]:
+    """
+    Predeclared balanced suite: exactly 22 families x 10 circuits = 220.
 
-def build_dep_graph(qc: QuantumCircuit, tol: float = ANGLE_TOL_DEFAULT) -> Tuple[nx.Graph, List[EdgeRecord]]:
-    qmap = qid_map(qc)
-    nodes = t_nodes(qc, tol=tol)
-    G = nx.Graph()
-    for k, (idx, name, qs) in enumerate(nodes):
-        G.add_node(k, circ_idx=int(idx), gate=name, qubits=tuple(qs))
-    idx2node = {idx: i for i, (idx, _, _) in enumerate(nodes)}
-    ops = []
-    for inst in qc.data:
-        ops.append((inst.operation.name.lower(), [qmap[q] for q in inst.qubits], inst))
-    records: List[EdgeRecord] = []
-    for q in range(qc.num_qubits):
-        seq = sorted([idx for (idx, _, qs) in nodes if q in qs])
-        # Adjacent T-like gates on the same wire are separated by the intermediate operations.
-        for a, b in zip(seq, seq[1:]):
-            na, nb = idx2node[a], idx2node[b]
-            unsafe = False
-            reason, blocker, bi = "", "", -1
-            for i in range(a + 1, b):
-                name, qs, _inst = ops[i]
-                if q not in qs:
-                    continue
-                if name in Z_PHASE_NAMES:
-                    continue
-                if name in ("cx", "cy", "cz", "ccx", "ccz", "mcx", "mcx_gray", "mcx_recursive"):
-                    ctrls, tgt = controls_target(name, qs)
-                    if tgt == q:
-                        unsafe = True; reason = "target_line_controlled_gate"; blocker = name; bi = i; break
-                    else:
-                        # T/Z phase on a control line commutes with controlled-X-like operations in this abstraction.
-                        continue
-                unsafe = True; reason = "same_wire_noncommuting_gate"; blocker = name; bi = i; break
-            if unsafe:
-                G.add_edge(na, nb, reason=reason, blocker=blocker, blocker_index=bi, shared_qubit=q)
-                records.append(EdgeRecord(na, nb, reason, blocker, bi, q))
-    return G, records
+    V8.3.1 correction
+    -----------------
+    The first V8.3 draft could generate duplicate benchmark IDs because several
+    deterministic families reused the same structural parameter tuple.  Merely
+    renaming those circuits would create pseudo-replication, so V8.3.1 fixes
+    the *benchmark design itself*:
 
-# ---------------------------------------------------------------------------
-# SAT coloring
-# ---------------------------------------------------------------------------
+      - every family has 10 predeclared, distinct parameter settings;
+      - every circuit_id includes the locked suite slot;
+      - exact serialized-circuit hashes are checked within each family;
+      - the run aborts if any within-family duplicate circuit is detected.
 
-@dataclass
-class SatResult:
-    Lstar: Optional[int]
-    assignment: Dict[int, int]
-    sat_calls: int
-    vars: int
-    clauses: int
-    time_s: float
-    trials: List[Dict[str, Any]]
-    conflicts: int = 0
-    decisions: int = 0
-    propagations: int = 0
-    restarts: int = 0
-    error: Optional[str] = None
+    Thus "10 circuits per family" means 10 genuinely distinct generated
+    circuits, not 10 labels for repeated instances.
+    """
+    out: List[Benchmark] = []
+    suite_hashes: Dict[str, set] = {f: set() for f in [
+        "BV","Path","Ring","Star","TOF","ER","ADD","RA","RICT","IQP","VQE",
+        "PP","BA","RCT","RR","RCNOTT","BRICK","CPL","DENSE","QFT","K4","HEA"
+    ]}
 
+    def _local_circuit_hash(qc: QuantumCircuit) -> str:
+        try:
+            payload = circuit_to_qasm2(qc)
+        except Exception:
+            qmap = qid_map(qc)
+            payload = repr([
+                (
+                    inst.operation.name.lower(),
+                    tuple(qmap[q] for q in inst.qubits),
+                    tuple(str(p) for p in getattr(inst.operation, "params", []))
+                )
+                for inst in qc.data
+            ])
+        return hashlib.sha256(payload.encode("utf-8", errors="ignore")).hexdigest()
 
-def sat_color(G: nx.Graph, L: int) -> Tuple[bool, Dict[int, int], int, int, Dict[str, int]]:
-    if not HAVE_PYSAT:
-        raise RuntimeError("python-sat unavailable")
-    cnf = CNF()
-    var: Dict[Tuple[int, int], int] = {}
-    def vv(v: int, c: int) -> int:
-        key = (int(v), int(c))
-        if key not in var:
-            var[key] = len(var) + 1
-        return var[key]
-    for v in G.nodes():
-        cnf.append([vv(v, c) for c in range(1, L + 1)])
-        for c1 in range(1, L + 1):
-            for c2 in range(c1 + 1, L + 1):
-                cnf.append([-vv(v, c1), -vv(v, c2)])
-    for u, v in G.edges():
-        for c in range(1, L + 1):
-            cnf.append([-vv(u, c), -vv(v, c)])
-    with Minisat22(bootstrap_with=cnf.clauses) as solver:
-        ok = bool(solver.solve())
-        stats = solver.accum_stats() or {}
-        stat_pack = {k:int(stats.get(k, 0) or 0) for k in ["conflicts", "decisions", "propagations", "restarts"]}
-        if not ok:
-            return False, {}, len(var), len(cnf.clauses), stat_pack
-        model = set(x for x in solver.get_model() if x > 0)
-    assignment = {}
-    for v in G.nodes():
-        for c in range(1, L + 1):
-            if vv(v, c) in model:
-                assignment[int(v)] = int(c); break
-    return True, assignment, len(var), len(cnf.clauses), stat_pack
+    def add(family: str, qc: QuantumCircuit, seed: int, slot: int):
+        if family not in suite_hashes:
+            raise RuntimeError(f"Unknown publication family: {family}")
+        h = _local_circuit_hash(qc)
+        if h in suite_hashes[family]:
+            raise RuntimeError(
+                f"Duplicate generated circuit INSIDE family={family}, slot={slot}, "
+                f"name={qc.name}. This is scientific pseudo-replication, so the "
+                f"publication suite is aborted rather than silently relabelled."
+            )
+        suite_hashes[family].add(h)
 
+        cid = safe_name(f"{family}_slot{slot:02d}_{qc.name}")
+        out.append(Benchmark(
+            family=family,
+            circuit_id=cid,
+            qc=qc,
+            seed=int(seed),
+        ))
 
-def clique_lb(G: nx.Graph) -> int:
-    if G.number_of_nodes() == 0: return 0
-    try:
-        return max((len(c) for c in nx.find_cliques(G)), default=1)
-    except Exception:
-        return 1
+    # ------------------------------------------------------------------
+    # Locked structural grids
+    # ------------------------------------------------------------------
+    # Ten unique (n,p) combinations for deterministic QAOA topology families.
+    qaoa_grid = [
+        (4,1),(5,1),(6,1),(7,1),(8,1),
+        (9,1),(10,1),(4,2),(6,2),(8,2),
+    ]
 
+    # Ten distinct sizes for deterministic chain/QFT families.
+    tof_sizes = [4,5,6,7,8,9,10,11,12,13]
+    qft_sizes = [3,4,5,6,7,8,9,10,11,12]
 
-def greedy_ub(G: nx.Graph) -> int:
-    if G.number_of_nodes() == 0: return 0
-    col = nx.coloring.greedy_color(G, strategy="largest_first")
-    return 1 + max(col.values(), default=-1)
+    # ADD remains workstation-safe by varying both width and repetition.
+    # We construct repetition by composing the proxy with itself; this yields
+    # genuinely distinct arithmetic-proxy circuits without inflating width to
+    # impractical values.
+    add_grid = [
+        (2,1),(3,1),(4,1),(5,1),
+        (2,2),(3,2),(4,2),
+        (2,3),(3,3),(2,4),
+    ]
 
+    # Controlled-phase-ladder and dense families use unique parameter pairs.
+    cpl_grid = [
+        (4,1),(5,1),(6,1),(7,1),(8,1),
+        (4,2),(5,2),(6,2),(7,2),(8,2),
+    ]
+    dense_grid = [
+        (4,1),(5,1),(6,1),(7,1),(8,1),
+        (4,2),(5,2),(6,2),(7,2),(8,2),
+    ]
 
-def compute_Lstar(G: nx.Graph) -> SatResult:
-    t0 = time.perf_counter()
-    if G.number_of_nodes() == 0:
-        return SatResult(0, {}, 0, 0, 0, 0.0, [])
-    try:
-        lb = clique_lb(G); ub = max(lb, greedy_ub(G))
-        bestL, bestAsg = None, {}
-        trials = []
-        calls, last_vars, last_clauses = 0, 0, 0
-        tot_conflicts = tot_decisions = tot_propagations = tot_restarts = 0
-        lo, hi = lb, ub
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            calls += 1
-            ok, asg, nv, nc, st = sat_color(G, mid)
-            last_vars, last_clauses = nv, nc
-            tot_conflicts += int(st.get("conflicts", 0)); tot_decisions += int(st.get("decisions", 0))
-            tot_propagations += int(st.get("propagations", 0)); tot_restarts += int(st.get("restarts", 0))
-            trials.append({"L": mid, "sat": bool(ok), "vars": nv, "clauses": nc, **st})
-            if ok:
-                bestL, bestAsg = mid, asg
-                hi = mid - 1
-            else:
-                lo = mid + 1
-        return SatResult(bestL, bestAsg, calls, last_vars, last_clauses, time.perf_counter() - t0, trials, tot_conflicts, tot_decisions, tot_propagations, tot_restarts)
-    except Exception as e:
-        return SatResult(None, {}, 0, 0, 0, time.perf_counter() - t0, [], error=repr(e))
+    for s in range(10):
+        seed = s
+        n, p = qaoa_grid[s]
 
-# ---------------------------------------------------------------------------
-# Graph invariants and spectral analysis
-# ---------------------------------------------------------------------------
+        # BV -- seed changes the secret string; n also varies.
+        add("BV", bv_oracle_like(max(3, n-1), seed), seed, s)
 
-def canonical_graph_hash(G: nx.Graph) -> str:
-    # Conservative WL hash + degree sequence + edge count. Use pynauty if available.
-    try:
-        if HAVE_PYNAUTY:
-            n = G.number_of_nodes()
-            adj = {int(i): sorted(int(j) for j in G.neighbors(i)) for i in G.nodes()}
-            pg = pynauty.Graph(number_of_vertices=n, adjacency_dict=adj, directed=False)
-            cert = pynauty.certificate(pg)
-            return hashlib.sha256(cert).hexdigest()
-    except Exception:
-        pass
-    try:
-        h = nx.weisfeiler_lehman_graph_hash(G)
-    except Exception:
-        h = "wl_unavailable"
-    deg = ",".join(map(str, sorted([d for _, d in G.degree()])))
-    base = f"n={G.number_of_nodes()}|m={G.number_of_edges()}|wl={h}|deg={deg}"
-    return sha256_text(base)
+        # Deterministic topology families -- unique (n,p).
+        add("Path", qaoa_path(n, p), seed, s)
+        add("Ring", qaoa_ring(n, p), seed, s)
+        add("Star", qaoa_star(n, p), seed, s)
 
+        # Toffoli chain -- 10 distinct sizes.
+        add("TOF", tof_chain(tof_sizes[s]), seed, s)
 
-def graph_spectrum(G: nx.Graph, k: int = 8) -> Dict[str, Any]:
-    n = G.number_of_nodes()
-    if n == 0:
-        return {"adj_spectral_radius":0.0, "lap_lambda2":0.0, "lap_spectral_radius":0.0, "spectrum_entropy":0.0, "top_adj_eigs":[]}
-    try:
-        A = nx.to_numpy_array(G, dtype=float)
-        eigs = np.linalg.eigvalsh(A)
-        abs_eigs = np.sort(np.abs(eigs))[::-1]
-        spectral_radius = float(abs_eigs[0]) if len(abs_eigs) else 0.0
-        L = nx.laplacian_matrix(G).toarray().astype(float)
-        leigs = np.sort(np.linalg.eigvalsh(L))
-        lam2 = float(leigs[1]) if len(leigs) > 1 else 0.0
-        lap_radius = float(leigs[-1]) if len(leigs) else 0.0
-        vals = np.abs(eigs)
-        s = float(vals.sum())
-        if s > 0:
-            p = vals / s
-            ent = float(-(p[p > 0] * np.log2(p[p > 0])).sum())
+        # ER -- stochastic graph seed + structural grid.
+        p_er = [0.20,0.25,0.30,0.35,0.40,0.22,0.28,0.33,0.38,0.45][s]
+        add("ER", qaoa_erdos_renyi(n, p_er, p, seed), seed, s)
+
+        # ADD -- width x repetition grid.
+        nadd, reps_add = add_grid[s]
+        base = modular_adder_proxy(nadd)
+        if reps_add == 1:
+            add_qc = base
         else:
-            ent = 0.0
-        return {
-            "adj_spectral_radius": spectral_radius,
-            "lap_lambda2": lam2,
-            "lap_spectral_radius": lap_radius,
-            "spectrum_entropy": ent,
-            "top_adj_eigs": [float(x) for x in np.sort(eigs)[::-1][:k]],
-        }
-    except Exception as e:
-        return {"adj_spectral_radius":None, "lap_lambda2":None, "lap_spectral_radius":None, "spectrum_entropy":None, "top_adj_eigs":[], "spectrum_error":repr(e)}
+            add_qc = QuantumCircuit(base.num_qubits,
+                                    name=f"modular_adder_proxy_n{nadd}_r{reps_add}")
+            for _ in range(reps_add):
+                add_qc.compose(base, inplace=True)
+        add("ADD", add_qc, seed, s)
 
+        # Seeded variational / random families.
+        add("RA", real_amplitudes_ct(n, 2 + (s % 3), seed), seed, s)
+        add("RICT", random_interaction_ct(
+            n,
+            3 + (s % 3),
+            seed,
+            [0.15,0.20,0.25,0.30,0.35][s % 5]
+        ), seed, s)
+        add("IQP", commuting_iqp(n, 6 + 2*(s % 5), seed), seed, s)
+        add("VQE", vqe_su2_ct(n, 2 + (s % 3), seed), seed, s)
+        add("PP", phase_polynomial_stress(n, 6 + 2*(s % 5), seed), seed, s)
+        add("BA", qaoa_barabasi_albert(n, 1 + (s % 2), p, seed), seed, s)
+        add("RCT", random_ct(n, 3 + (s % 4), seed), seed, s)
 
-def graph_metrics(G: nx.Graph) -> Dict[str, Any]:
-    n = G.number_of_nodes(); m = G.number_of_edges()
-    degs = [d for _, d in G.degree()]
-    out: Dict[str, Any] = {
-        "g_n": int(n), "g_m": int(m),
-        "g_density": float(nx.density(G)) if n > 1 else 0.0,
-        "g_maxdeg": int(max(degs, default=0)),
-        "g_avgdeg": float(sum(degs) / n) if n else 0.0,
-        "g_components": int(nx.number_connected_components(G)) if n else 0,
-        "g_largest_component": int(max((len(c) for c in nx.connected_components(G)), default=0)) if n else 0,
-        "g_is_bipartite": bool(nx.is_bipartite(G)) if n else True,
-    }
-    try: out["g_is_chordal"] = bool(nx.is_chordal(G)) if n else True
-    except Exception: out["g_is_chordal"] = None
-    try:
-        tw, _ = nx.approximation.treewidth_min_fill_in(G)
-        out["g_treewidth_minfill"] = int(tw)
-    except Exception:
-        out["g_treewidth_minfill"] = None
-    try:
-        out["g_clustering_avg"] = float(nx.average_clustering(G)) if n else 0.0
-    except Exception: out["g_clustering_avg"] = None
-    # Degree assortativity is undefined for many degenerate dependency graphs
-    # (e.g. all degrees equal, empty variance). NetworkX emits RuntimeWarning
-    # in these cases; treat the value as 0.0 so long runs stay readable.
-    try:
-        if m > 0 and n > 2:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", RuntimeWarning)
-                assort = nx.degree_assortativity_coefficient(G)
-            out["g_assortativity"] = float(assort) if np.isfinite(assort) else 0.0
-        else:
-            out["g_assortativity"] = 0.0
-    except Exception:
-        out["g_assortativity"] = 0.0
-    out.update(graph_spectrum(G))
-    out["g_hash"] = canonical_graph_hash(G)
+        # Random regular -- seed makes same-size instances distinct.
+        degree = 2 if n <= 5 else 3
+        add("RR", qaoa_random_regular(n, degree, p, seed), seed, s)
+
+        add("RCNOTT", random_cnot_t_layered(n, 5 + (s % 5), seed), seed, s)
+        add("BRICK", brickwork_ct(n, 3 + (s % 5), seed), seed, s)
+
+        # Deterministic CPL unique grid.
+        ncpl, dcpl = cpl_grid[s]
+        add("CPL", controlled_phase_ladder(ncpl, dcpl), seed, s)
+
+        # Deterministic dense family unique grid.
+        ndense, rdense = dense_grid[s]
+        add("DENSE", dense_phase(ndense, rdense), seed, s)
+
+        # QFT-like family -- 10 distinct sizes.
+        add("QFT", qft_phase_like(qft_sizes[s]), seed, s)
+
+        # K4 seed/repetition both influence the circuit.
+        add("K4", k4_motif_ct(1 + (s % 3), seed), seed, s)
+
+        # HEA -- entanglement topology, size, reps and seed vary.
+        add("HEA", hardware_efficient_ct(
+            n,
+            2 + (s % 3),
+            seed,
+            ["linear","circular","full"][s % 3]
+        ), seed, s)
+
+    # ------------------------------------------------------------------
+    # Hard scientific locks
+    # ------------------------------------------------------------------
+    counts = Counter(b.family for b in out)
+
+    if LOCK_BALANCED_SUITE:
+        if len(counts) != PUBLICATION_FAMILIES:
+            raise RuntimeError(
+                f"Balanced-suite lock failed: expected {PUBLICATION_FAMILIES} "
+                f"families, got {len(counts)}: {dict(counts)}"
+            )
+
+        bad = {k:v for k,v in counts.items() if v != CIRCUITS_PER_FAMILY}
+        if bad:
+            raise RuntimeError(
+                f"Balanced-suite lock failed: every family must contain "
+                f"{CIRCUITS_PER_FAMILY} circuits; bad={bad}"
+            )
+
+        if len(out) != EXPECTED_PUBLICATION_CIRCUITS:
+            raise RuntimeError(
+                f"Balanced-suite lock failed: expected "
+                f"{EXPECTED_PUBLICATION_CIRCUITS} circuits, got {len(out)}"
+            )
+
+    # Global IDs must be unique.
+    ids = [b.circuit_id for b in out]
+    if len(ids) != len(set(ids)):
+        dup = [x for x,c in Counter(ids).items() if c > 1]
+        raise RuntimeError(
+            f"Duplicate circuit IDs in publication suite: {dup[:20]}"
+        )
+
+    # Redundant second duplicate check by family and exact serialization.
+    # This is intentionally independent of circuit_id.
+    for fam in sorted(counts):
+        fam_b = [b for b in out if b.family == fam]
+        fam_hashes = [_local_circuit_hash(b.qc) for b in fam_b]
+        if len(fam_hashes) != len(set(fam_hashes)):
+            raise RuntimeError(
+                f"Post-build exact duplicate audit failed in family {fam}"
+            )
+
     return out
 
-# ---------------------------------------------------------------------------
-# Equivalence guards
-# ---------------------------------------------------------------------------
+# =============================================================================
+# Core self-tests
+# =============================================================================
 
-def equal_by_statevector(a: QuantumCircuit, b: QuantumCircuit, max_qubits: int = 10, trials: int = 16, seed: int = 0) -> Tuple[Optional[bool], str]:
-    if a.num_qubits != b.num_qubits:
-        return False, "different_num_qubits"
-    n = a.num_qubits
-    if n > max_qubits:
-        # Random basis tests only; not a proof, just a guard.
-        rnd = random.Random(seed)
+def run_core_self_tests() -> pd.DataFrame:
+    rows = []
+
+    def record(name: str, fn):
         try:
-            for _ in range(trials):
-                bits = [rnd.randint(0, 1) for _ in range(n)]
-                init = Statevector.from_label("".join(map(str, reversed(bits))))
-                va = init.evolve(a).data
-                vb = init.evolve(b).data
-                if not np.allclose(va, vb, atol=1e-7):
-                    return False, "random_basis_counterexample"
-            return None, "random_basis_pass_not_proof"
+            fn()
+            rows.append({"test":name, "status":"PASS", "detail":""})
         except Exception as e:
-            return None, f"statevector_unavailable:{repr(e)}"
+            rows.append({
+                "test":name,
+                "status":"FAIL",
+                "detail":f"{type(e).__name__}:{e}"
+            })
+
+    def test_xyz():
+        X = PauliSig((1,), (0,))
+        Y = PauliSig((1,), (1,))
+        Z = PauliSig((0,), (1,))
+        assert symplectic_product(X,Y) == 1
+        assert symplectic_product(X,Z) == 1
+        assert symplectic_product(Y,Z) == 1
+        assert symplectic_product(X,X) == 0
+    record("symplectic_XYZ", test_xyz)
+
+    def test_k3():
+        ev = [
+            TEvent(0,0,0,"t",1,PauliSig((1,),(0,))),
+            TEvent(1,1,0,"t",1,PauliSig((1,),(1,))),
+            TEvent(2,2,0,"t",1,PauliSig((0,),(1,))),
+        ]
+        G, _ = build_anticommutation_graph(ev)
+        chi, col, rep = exact_chromatic_with_crosscheck(G)
+        assert chi == 3
+        assert validate_color_classes_commute(ev, col)
+    record("K3_chi3", test_k3)
+
+    def test_rebase():
+        qc = QuantumCircuit(3)
+        qc.rx(math.pi/4, 0)
+        qc.ry(-math.pi/4, 1)
+        qc.rz(3*math.pi/4, 2)
+        qc.ccx(0,1,2)
+        ct = exact_ct_rebase(qc)
+        eq = operator_equiv_up_to_phase(qc, ct, max_qubits=3)
+        assert eq is True
+    record("exact_rebase_operator_equiv", test_rebase)
+
+    def test_suffix():
+        qc = QuantumCircuit(1)
+        qc.t(0)
+        qc.h(0)
+        ct = exact_ct_rebase(qc)
+        ev = extract_pauli_events(ct)
+        assert ev[0].pauli == PauliSig((1,), (0,))
+    record("suffix_orientation", test_suffix)
+
+    def test_event_count():
+        qc = QuantumCircuit(2)
+        qc.t(0)
+        qc.h(0)
+        qc.tdg(1)
+        qc.cx(0,1)
+        qc.t(1)
+        ct = exact_ct_rebase(qc)
+        explicit = sum(
+            inst.operation.name.lower() in ("t","tdg")
+            for inst in ct.data
+        )
+        ev = extract_pauli_events(ct)
+        assert explicit == len(ev)
+    record("event_count_matches_T_count", test_event_count)
+
+
+    def test_direct_signature_and_reconstruction():
+        qc = QuantumCircuit(3)
+        qc.t(0)
+        qc.h(0)
+        qc.cx(0, 1)
+        qc.tdg(1)
+        qc.s(2)
+        qc.cx(1, 2)
+        qc.t(2)
+        qc.h(2)
+        ct = exact_ct_rebase(qc)
+        ev = extract_pauli_events(ct)
+        G, _ = build_anticommutation_graph(ev)
+        deep = deep_validate_pauli_model(ct, ev, G)
+        assert deep["pass"] is True
+        assert deep["direct_signature_validation"]["all_signature_matches"] is True
+        assert deep["direct_signature_validation"]["all_pair_commutation_matches"] is True
+        assert deep["projective_rotation_reconstruction"]["equivalent_up_to_global_phase"] is True
+    record("direct_signature_and_rotation_reconstruction", test_direct_signature_and_reconstruction)
+
+    def test_zero_T_empty_graph_pipeline():
+        qc = QuantumCircuit(2)
+        qc.h(0)
+        qc.s(1)
+        qc.cx(0,1)
+        qc.h(1)
+        ct = exact_ct_rebase(qc)
+        ev = extract_pauli_events(ct)
+        assert len(ev) == 0
+        G, edge_df = build_anticommutation_graph(ev)
+        assert G.number_of_nodes() == 0
+        assert G.number_of_edges() == 0
+        assert list(edge_df.columns) == EDGE_DF_COLUMNS
+        evdf = event_dataframe(ev)
+        assert list(evdf.columns) == EVENT_DF_COLUMNS
+        chi, col, _ = exact_chromatic_with_crosscheck(G)
+        assert chi == 0
+        assert col == {}
+        cert = coloring_certificate(G, chi, col)
+        assert cert["chi"] == 0
+        deep = deep_validate_pauli_model(ct, ev, G)
+        assert deep["pass"] is True
+    record("zero_T_empty_graph_pipeline", test_zero_T_empty_graph_pipeline)
+
+    def test_hand_certificate_triangle():
+        ev = [
+            TEvent(0,0,0,"t",1,PauliSig((1,),(0,))),
+            TEvent(1,1,0,"t",1,PauliSig((1,),(1,))),
+            TEvent(2,2,0,"t",1,PauliSig((0,),(1,))),
+        ]
+        G, _ = build_anticommutation_graph(ev)
+        chi, col, _ = exact_chromatic_with_crosscheck(G)
+        cert = coloring_certificate(G, chi, col)
+        assert chi == 3
+        assert cert["hand_checkable_exact"] is True
+        assert cert["clique_size"] == 3
+    record("hand_checkable_triangle_certificate", test_hand_certificate_triangle)
+
+    return pd.DataFrame(rows)
+
+# =============================================================================
+# Variant analysis
+# =============================================================================
+
+def circuit_serialization_hash(qc: QuantumCircuit) -> str:
     try:
-        # Compare operator up to global phase using statevector basis sweep.
-        phase = None
-        for x in range(2 ** n):
-            bits = [(x >> i) & 1 for i in range(n)]
-            init = Statevector.from_label("".join(map(str, reversed(bits))))
-            va = init.evolve(a).data
-            vb = init.evolve(b).data
-            if np.linalg.norm(va) == 0 or np.linalg.norm(vb) == 0:
-                continue
-            # Find a nonzero component for phase alignment.
-            idx = int(np.argmax(np.abs(vb)))
-            if abs(vb[idx]) > 1e-10:
-                ph = va[idx] / vb[idx]
-                if phase is None: phase = ph
-                if not np.allclose(va, phase * vb, atol=1e-7):
-                    return False, f"basis_counterexample:{x}"
-            else:
-                if not np.allclose(va, vb, atol=1e-7):
-                    return False, f"basis_counterexample:{x}"
-        return True, "full_basis_statevector"
-    except Exception as e:
-        return None, f"statevector_error:{repr(e)}"
-
-
-def _parse_qcec_result(res) -> Tuple[Optional[bool], str]:
-    """Parse MQT-QCEC result objects across several API versions.
-
-    MQT-QCEC has changed small parts of its Python API over time. Some
-    versions expose a Configuration class, while others expect a plain
-    qcec.verify(circ1, circ2) call. Result fields may also be enums/strings
-    rather than booleans. This parser keeps the experiment robust and records
-    an explicit method tag instead of failing the whole run.
-    """
-    try:
-        for attr in ("equivalent", "considered_equivalent", "equivalence", "result", "status"):
-            if hasattr(res, attr):
-                val = getattr(res, attr)
-                if callable(val):
-                    val = val()
-                if isinstance(val, bool):
-                    return bool(val), f"mqt_qcec:{attr}"
-                s = str(val).strip().lower()
-                # Handle enum-like values such as EquivalenceCriterion.equivalent
-                # and strings such as "equivalent" / "not_equivalent".
-                if any(tok in s for tok in ("not_equiv", "not equivalent", "nonequivalent", "non_equiv", "false")):
-                    return False, f"mqt_qcec:{attr}:{s}"
-                if any(tok in s for tok in ("equivalent", "true")):
-                    return True, f"mqt_qcec:{attr}:{s}"
-    except Exception as e:
-        return None, f"qcec_parse_error:{repr(e)}"
-    return None, "qcec_unknown_result"
-
-
-def qcec_equiv(a: QuantumCircuit, b: QuantumCircuit) -> Tuple[Optional[bool], str]:
-    if not HAVE_QCEC:
-        return None, "qcec_unavailable"
-
-    attempts = []
-
-    # Newer documented API: qcec.verify(qc1, qc2), optionally with kwargs.
-    try:
-        attempts.append("verify_no_config")
-        res = mqt_qcec.verify(a, b)
-        verdict, method = _parse_qcec_result(res)
-        if verdict is not None:
-            return verdict, method + ":verify_no_config"
-    except Exception as e:
-        last_error = repr(e)
-    else:
-        last_error = "unknown_result"
-
-    # Some versions expose Configuration either as mqt_qcec.Configuration or
-    # in a submodule. Use it only if available.
-    for cfg_getter_name in ("Configuration",):
-        try:
-            cfg_cls = getattr(mqt_qcec, cfg_getter_name, None)
-            if cfg_cls is None:
-                continue
-            attempts.append("verify_with_configuration")
-            cfg = cfg_cls()
-            try:
-                res = mqt_qcec.verify(a, b, configuration=cfg)
-            except TypeError:
-                res = mqt_qcec.verify(a, b, cfg)
-            verdict, method = _parse_qcec_result(res)
-            if verdict is not None:
-                return verdict, method + ":verify_with_configuration"
-        except Exception as e:
-            last_error = repr(e)
-
-    # Last resort: write temporary QASM2 files and call the documented file API.
-    # This helps if the installed binding has trouble with Qiskit circuit objects.
-    try:
-        import tempfile
-        from qiskit.qasm2 import dumps as _qasm2_dumps
-        with tempfile.TemporaryDirectory() as td:
-            pa = os.path.join(td, "a.qasm")
-            pb = os.path.join(td, "b.qasm")
-            with open(pa, "w", encoding="utf-8") as fa:
-                fa.write(_qasm2_dumps(a))
-            with open(pb, "w", encoding="utf-8") as fb:
-                fb.write(_qasm2_dumps(b))
-            attempts.append("verify_qasm_files")
-            res = mqt_qcec.verify(pa, pb)
-            verdict, method = _parse_qcec_result(res)
-            if verdict is not None:
-                return verdict, method + ":verify_qasm_files"
-    except Exception as e:
-        last_error = repr(e)
-
-    return None, f"qcec_unresolved:attempts={'+'.join(attempts)};last={last_error}"
-
-
-def equivalence_guard(original: QuantumCircuit, variant: QuantumCircuit, max_qubits: int, pairwise: bool, seed: int) -> Tuple[str, str]:
-    # Return status in {pass, fail, unknown} and method detail.
-    qv, qm = qcec_equiv(original, variant)
-    if qv is True: return "pass", qm
-    if qv is False: return "fail", qm
-    sv, sm = equal_by_statevector(original, variant, max_qubits=max_qubits, seed=seed)
-    if sv is True: return "pass", sm
-    if sv is False: return "fail", sm
-    return "unknown", f"{qm};{sm}"
-
-# ---------------------------------------------------------------------------
-# Per-variant analysis
-# ---------------------------------------------------------------------------
-
-@dataclass
-class RunConfig:
-    outdir: str
-    mode: str
-    angle_tol: float = ANGLE_TOL_DEFAULT
-    max_equiv_qubits: int = 10
-    pairwise_equivalence: bool = False
-    random_rewrite_seeds: Tuple[int, ...] = (0, 1, 2)
-    random_seeds: Tuple[int, ...] = (0, 1, 2)
-    save_graphml: bool = True
-    save_qasm: bool = True
-    max_instances: Optional[int] = None
-    qasm_dir: Optional[str] = None
-    qasm_recursive: bool = False
-    qasm_limit: Optional[int] = None
-    include_mqtbench: bool = False
-    include_supermarq: bool = False
-    enable_tket: bool = False
-    include_grover: bool = False
-    include_qaoa_p2_large: bool = False
-    max_qaoa_p2_n: int = 10
-    include_random_cnot_t_large: bool = False
-    max_random_cnot_t_n: int = 10
-    include_hea_large: bool = False
-    max_hea_n: int = 12
-    include_qaoa_rr_large: bool = False
-    max_qaoa_rr_n: int = 10
-    random_cnot_t_heavy_n: int = 10
-    hea_heavy_n: int = 12
-    skip_tket_on_medium_large_heavy: bool = True
-    skip_known_heavy_cases: bool = True
-    fast_strategies_only: bool = False
-    external_max_qubits: int = 64
-    external_max_ops: int = 200000
-    large_proxy_equiv_unknown_ok: bool = True
-    draw_graph_png: bool = False
-    graph_png_max_nodes: int = 80
-    partial_save_every: int = 5
-    max_variant_seconds: int = 180
-    max_grover_variant_seconds: int = 45
-    resume: bool = True
-    skip_timed_out_strategy_after: int = 5
-
-
-def edge_provenance_summary(records: List[EdgeRecord]) -> Dict[str, Any]:
-    blockers = Counter(r.blocker for r in records)
-    reasons = Counter(r.reason for r in records)
-    return {
-        "edge_blocker_hist": dict(sorted(blockers.items())),
-        "edge_reason_hist": dict(sorted(reasons.items())),
-        "edge_records": [dataclasses.asdict(r) for r in records[:500]],  # cap for JSON size
-    }
-
-
-
-def strategy_provenance_features(trace: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    """Flatten a normalization trace into paper-friendly provenance features."""
-    if not trace:
-        return {
-            "norm_tool":"unknown", "norm_mode":"unknown", "norm_ops_count":0,
-            "norm_spider_delta":None, "norm_edge_delta":None,
-            "norm_ops_hist_json":"{}"
-        }
-    tool = str(trace.get("tool", "unknown"))
-    mode = str(trace.get("mode", trace.get("pass", "unknown")))
-    ops = trace.get("ops", []) or []
-    op_hist = Counter(str(o).split(":", 1)[0] for o in ops)
-    pre, post = trace.get("pre", {}) or {}, trace.get("post", {}) or {}
-    def delta(key):
-        try:
-            return int(post.get(key)) - int(pre.get(key))
-        except Exception:
-            return None
-    return {
-        "norm_tool": tool,
-        "norm_mode": mode,
-        "norm_ops_count": int(len(ops)),
-        "norm_spider_delta": delta("vertices"),
-        "norm_edge_delta": delta("edges"),
-        "norm_ops_hist_json": json.dumps(dict(sorted(op_hist.items())), sort_keys=True),
-    }
-
-
-def phase_gadget_proxy_metrics(qc: QuantumCircuit, tol: float = ANGLE_TOL_DEFAULT) -> Dict[str, Any]:
-    """Approximate phase-gadget statistics from the extracted Clifford+T circuit.
-
-    This is a conservative proxy, not a full ZX phase-gadget parser.
-    It tracks T-like RZ/T nodes, wire distribution, angle classes, and local CNOT
-    context that often explains changes in dependency graphs after extraction.
-    """
-    qmap = qid_map(qc)
-    tns = t_nodes(qc, tol=tol)
-    per_wire = Counter()
-    angle_class = Counter()
-    cnot_near = 0
-    h_near = 0
-    ops = list(qc.data)
-    for idx, name, qs in tns:
-        for q in qs: per_wire[int(q)] += 1
-        angle_class[str(name)] += 1
-        for j in [idx-2, idx-1, idx+1, idx+2]:
-            if 0 <= j < len(ops):
-                nm = ops[j].operation.name.lower()
-                if nm in ("cx", "cz", "ccx", "ccz", "mcx", "mcx_gray", "mcx_recursive"):
-                    try:
-                        if set(qmap[q] for q in ops[j].qubits) & set(qs): cnot_near += 1
-                    except Exception: pass
-                if nm == "h":
-                    try:
-                        if set(qmap[q] for q in ops[j].qubits) & set(qs): h_near += 1
-                    except Exception: pass
-    counts = list(per_wire.values())
-    if counts:
-        mean = float(sum(counts)/len(counts)); mx = int(max(counts)); mn = int(min(counts))
-        var = float(sum((x-mean)**2 for x in counts)/len(counts))
-    else:
-        mean = mx = mn = var = 0
-    # A simple phase interaction proxy: connect wires that co-occur within a small CNOT/RZ/CNOT window.
-    PG = nx.Graph(); PG.add_nodes_from(range(qc.num_qubits))
-    for i, inst in enumerate(ops):
-        nm = inst.operation.name.lower()
-        if nm in ("cx", "cz"):
-            qs = [qmap[q] for q in inst.qubits]
-            if len(qs) == 2:
-                window = ops[max(0,i-2):min(len(ops),i+3)]
-                if any(w.operation.name.lower() in Z_PHASE_NAMES for w in window):
-                    PG.add_edge(qs[0], qs[1])
-        elif nm in ("ccx", "ccz", "mcx", "mcx_gray", "mcx_recursive"):
-            qs = [qmap[q] for q in inst.qubits]
-            for a,b in itertools.combinations(qs, 2): PG.add_edge(a,b)
-    try:
-        pg_tw, _ = nx.algorithms.approximation.treewidth_min_fill_in(PG)
+        return sha256_text(circuit_to_qasm2(qc))
     except Exception:
-        pg_tw = None
-    return {
-        "phase_proxy_tlike_nodes": int(len(tns)),
-        "phase_proxy_active_wires": int(len(per_wire)),
-        "phase_proxy_max_per_wire": mx,
-        "phase_proxy_min_per_wire": mn,
-        "phase_proxy_mean_per_wire": mean,
-        "phase_proxy_var_per_wire": var,
-        "phase_proxy_angle_hist_json": json.dumps(dict(sorted(angle_class.items())), sort_keys=True),
-        "phase_proxy_t_wire_hist_json": json.dumps({str(k):int(v) for k,v in sorted(per_wire.items())}, sort_keys=True),
-        "phase_proxy_cnot_neighborhood_hits": int(cnot_near),
-        "phase_proxy_h_neighborhood_hits": int(h_near),
-        "phase_interaction_edges": int(PG.number_of_edges()),
-        "phase_interaction_density": float(nx.density(PG)) if PG.number_of_nodes() > 1 else 0.0,
-        "phase_interaction_treewidth": pg_tw,
-        "phase_interaction_hash": canonical_graph_hash(PG),
-    }
+        # Stable-ish fallback from gate sequence.
+        qmap = qid_map(qc)
+        parts = []
+        for inst in qc.data:
+            parts.append((
+                inst.operation.name.lower(),
+                tuple(qmap[q] for q in inst.qubits),
+                tuple(str(p) for p in getattr(inst.operation, "params", []))
+            ))
+        return sha256_text(repr(parts))
 
+def pauli_sequence_hash(events: List[TEvent]) -> str:
+    data = [
+        (e.gate, e.sign, e.pauli.label())
+        for e in events
+    ]
+    return sha256_text(repr(data))
 
-def dependency_edge_extended_metrics(G: nx.Graph, records: List[EdgeRecord]) -> Dict[str, Any]:
-    blockers = Counter(r.blocker for r in records)
-    reasons = Counter(r.reason for r in records)
-    shared = Counter(str(r.shared_qubit) for r in records)
-    target_edges = sum(1 for r in records if r.reason == "target_line_controlled_gate")
-    noncomm_edges = sum(1 for r in records if r.reason == "same_wire_noncommuting_gate")
-    return {
-        "dep_edges_target_line": int(target_edges),
-        "dep_edges_same_wire_noncommuting": int(noncomm_edges),
-        "dep_edges_controlled_fraction": float(target_edges / len(records)) if records else 0.0,
-        "dep_blocker_top": blockers.most_common(1)[0][0] if blockers else "none",
-        "dep_blocker_top_count": int(blockers.most_common(1)[0][1]) if blockers else 0,
-        "dep_shared_wire_hist_json": json.dumps(dict(sorted(shared.items())), sort_keys=True),
-        "dep_blocker_hist_json_v4": json.dumps(dict(sorted(blockers.items())), sort_keys=True),
-        "dep_reason_hist_json_v4": json.dumps(dict(sorted(reasons.items())), sort_keys=True),
-    }
+EVENT_DF_COLUMNS = [
+    "event_id","circuit_index","qubit","gate","sign","pauli","x_bits","z_bits"
+]
 
+EDGE_DF_COLUMNS = [
+    "u","v","u_pauli","v_pauli","symplectic_product","reason"
+]
 
-def analyze_variant(spec: BenchmarkSpec, norm: NormResult, original_t: QuantumCircuit, cfg: RunConfig, inst_dir: Path, logp: Path) -> Dict[str, Any]:
+def event_dataframe(events: List[TEvent]) -> pd.DataFrame:
+    """
+    Empty-event safe event table.
+
+    A legitimate normalization may remove every explicit T/Tdg event.  That is
+    a scientifically valid zero-T representation, not an analysis error.
+    Therefore the DataFrame schema is fixed even when events == [].
+    """
+    rows = [
+        {
+            "event_id": e.event_id,
+            "circuit_index": e.circuit_index,
+            "qubit": e.qubit,
+            "gate": e.gate,
+            "sign": e.sign,
+            "pauli": e.pauli.label(),
+            "x_bits": "".join(map(str, e.pauli.x)),
+            "z_bits": "".join(map(str, e.pauli.z)),
+        }
+        for e in events
+    ]
+    return pd.DataFrame(rows, columns=EVENT_DF_COLUMNS)
+
+def analyze_normalized_variant(
+    bench: Benchmark,
+    norm: NormResult,
+    original: QuantumCircuit,
+    strategy_dir: Path,
+) -> Tuple[Dict[str, Any], Optional[nx.Graph]]:
+
+    t_branch0 = time.perf_counter()
+
     row: Dict[str, Any] = {
-        "family": spec.family,
-        "circuit_id": spec.circuit_id,
-        "n": spec.n,
-        "physical_qubits": spec.physical_qubits,
-        "logical_size": spec.logical_size,
-        "size_param": spec.size_param,
-        "seed": spec.seed,
+        "family": bench.family,
+        "circuit_id": bench.circuit_id,
+        "seed": bench.seed,
         "strategy": norm.strategy,
+        "tool": norm.tool,
         "norm_success": bool(norm.success),
         "norm_error": norm.error,
+        "norm_trace_json": json.dumps(norm.trace, sort_keys=True, default=str),
+        "normalization_runtime_s":float((norm.trace or {}).get("normalization_runtime_s", 0.0)),
+        "original_qubits": original.num_qubits,
+        "original_ops": len(original.data),
+        "original_depth": int(original.depth() or 0),
     }
-    if norm.trace is not None:
-        row["norm_trace_json"] = json.dumps(norm.trace, sort_keys=True, default=str)
-    row.update(strategy_provenance_features(norm.trace))
-    if not norm.success or norm.qc is None:
-        row.update({"equiv_status":"not_run", "analysis_success":False,
-                    "failure_category": failure_category(norm.strategy, norm.error, norm.trace)})
-        return row
-    qc = norm.qc
-    try:
-        qc = transpile_ct(qc, opt=0)
-    except Exception:
-        pass
-    row["variant_qubits"] = qc.num_qubits
-    row["variant_ops"] = len(qc.data)
-    row["variant_depth"] = int(qc.depth() or 0)
-    row["input_size_class_pre"] = size_class_from_counts(qc.num_qubits, None, len(qc.data))
-    hist = gate_histogram(qc)
-    row["gate_hist_json"] = json.dumps(hist, sort_keys=True)
-    row["cx_count"] = hist.get("cx", 0)
-    row["ccx_count"] = hist.get("ccx", 0)
-    row["h_count"] = hist.get("h", 0)
-    row["rz_count"] = hist.get("rz", 0)
-    row.update(phase_gadget_proxy_metrics(qc, tol=cfg.angle_tol))
 
-    eq_status, eq_method = equivalence_guard(original_t, qc, cfg.max_equiv_qubits, cfg.pairwise_equivalence, seed=spec.seed)
+    if not norm.success or norm.qc is None:
+        row.update({
+            "equiv_status":"not_run",
+            "analysis_success":False,
+            "failure_category":"normalization_failed",
+        })
+        return row, None
+
+    variant = norm.qc
+
+    row["variant_qubits"] = variant.num_qubits
+    row["variant_ops"] = len(variant.data)
+    row["variant_depth"] = int(variant.depth() or 0)
+    row["variant_gate_hist_json"] = json.dumps(
+        gate_histogram(variant), sort_keys=True
+    )
+    row["variant_hash"] = circuit_serialization_hash(variant)
+
+    t_eq0 = time.perf_counter()
+    eq_status, eq_method = equivalence_guard(
+        original, variant, seed=bench.seed
+    )
+    t_eq1 = time.perf_counter()
+    row["equivalence_runtime_s"] = float(t_eq1-t_eq0)
     row["equiv_status"] = eq_status
     row["equiv_method"] = eq_method
-    # Only analyze pass/unknown. Evidence claims later only use pass.
+
     if eq_status == "fail":
-        row.update({"analysis_success":False, "failure_category":"equivalence_failed"})
-        return row
-
-    try:
-        if cfg.save_qasm:
-            save_qasm(qc, inst_dir / f"{safe_name(norm.strategy)}.qasm")
-        G, edges = build_dep_graph(qc, tol=cfg.angle_tol)
-        if cfg.save_graphml:
-            try:
-                write_graphml_safe(G, inst_dir / f"{safe_name(norm.strategy)}.graphml")
-            except Exception as e:
-                append_log(logp, f"GraphML export failed after sanitization {spec.circuit_id}/{norm.strategy}: {e}")
-            if cfg.draw_graph_png and G.number_of_nodes() <= cfg.graph_png_max_nodes:
-                try:
-                    draw_dependency_graph_safe(G, inst_dir / f"{safe_name(norm.strategy)}_depgraph.png")
-                except Exception:
-                    pass
-        gm = graph_metrics(G)
-        sat = compute_Lstar(G)
-        prov = edge_provenance_summary(edges)
-        prov_ext = dependency_edge_extended_metrics(G, edges)
-        json_dump(inst_dir / f"{safe_name(norm.strategy)}_graph_metrics.json", {"graph_metrics": gm, "sat": dataclasses.asdict(sat), "edge_provenance": prov, "edge_provenance_extended": prov_ext})
-        row.update(gm)
-        row.update(prov_ext)
-        _tc = len(t_nodes(qc, tol=cfg.angle_tol))
         row.update({
-            "analysis_success": True,
-            "t_count": _tc,
-            "size_class": size_class_from_counts(qc.num_qubits, _tc, len(qc.data)),
-            "naive_tdepth": naive_tdepth(qc, tol=cfg.angle_tol),
-            "clique_lb": clique_lb(G),
-            "greedy_ub": greedy_ub(G),
-            "Lstar": sat.Lstar,
-            "sat_assignment_json": json.dumps(sat.assignment, sort_keys=True),
-            "sat_calls": sat.sat_calls,
-            "sat_vars": sat.vars,
-            "sat_clauses": sat.clauses,
-            "sat_clause_var_ratio": float(sat.clauses / sat.vars) if sat.vars else 0.0,
-            "sat_time_s": sat.time_s,
-            "sat_conflicts": sat.conflicts,
-            "sat_decisions": sat.decisions,
-            "sat_propagations": sat.propagations,
-            "sat_restarts": sat.restarts,
-            "sat_decision_per_var": float(sat.decisions / sat.vars) if sat.vars else 0.0,
-            "sat_propagation_per_clause": float(sat.propagations / sat.clauses) if sat.clauses else 0.0,
-            "sat_error": sat.error,
-            "edge_blocker_hist_json": json.dumps(prov["edge_blocker_hist"], sort_keys=True),
-            "edge_reason_hist_json": json.dumps(prov["edge_reason_hist"], sort_keys=True),
+            "analysis_success":False,
+            "failure_category":"equivalence_failed",
         })
-        return row
+        return row, None
+
+    t_rebase0 = time.perf_counter()
+    try:
+        ct = exact_ct_rebase(variant)
     except Exception as e:
-        row.update({"analysis_success":False, "analysis_error":repr(e),
-                    "failure_category": failure_category(norm.strategy, repr(e), norm.trace),
-                    "analysis_traceback":traceback.format_exc()[-3000:]})
-        return row
+        msg = repr(e)
+        # Qiskit high-level compiler passes may synthesize a semantically exact
+        # Clifford+T unitary into generic one-qubit rotations whose individual
+        # parameters are no longer multiples of pi/4.  Such output is outside
+        # the fixed event model unless an exact CT resynthesis is available.
+        # Never round/approximate the angle.  Classify transparently instead.
+        if "not an exact multiple of pi/4" in msg:
+            category = "exact_CT_model_out_of_domain"
+        else:
+            category = "ct_rebase_failed"
+        row.update({
+            "analysis_success":False,
+            "claim_eligible":False,
+            "failure_category":category,
+            "analysis_error":msg,
+        })
+        return row, None
 
-# ---------------------------------------------------------------------------
-# Aggregation and classification
-# ---------------------------------------------------------------------------
+    t_rebase1 = time.perf_counter()
+    row["ct_rebase_runtime_s"] = float(t_rebase1-t_rebase0)
 
-def classify_groups(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    row["ct_ops"] = len(ct.data)
+    row["ct_depth"] = int(ct.depth() or 0)
+    row["ct_t_count"] = int(sum(
+        inst.operation.name.lower() in ("t","tdg")
+        for inst in ct.data
+    ))
+
+    # Small-circuit independent rebase check.
+    rebase_eq = operator_equiv_up_to_phase(
+        variant, ct, max_qubits=MAX_OPERATOR_CHECK_QUBITS
+    )
+    row["rebase_equiv_checked"] = (rebase_eq is not None)
+    row["rebase_equiv_pass"] = rebase_eq
+
+    if rebase_eq is False:
+        row.update({
+            "analysis_success":False,
+            "failure_category":"ct_rebase_equivalence_failed",
+        })
+        return row, None
+
+    t_event0 = time.perf_counter()
+    events = extract_pauli_events(ct)
+    t_event1 = time.perf_counter()
+    row["pauli_event_extraction_runtime_s"] = float(t_event1-t_event0)
+
+    if len(events) != row["ct_t_count"]:
+        raise AssertionError(
+            f"{bench.circuit_id}/{norm.strategy}: "
+            f"event count != explicit T-count"
+        )
+
+    t_graph0 = time.perf_counter()
+    G, edge_df = build_anticommutation_graph(events)
+    t_graph1 = time.perf_counter()
+    row["graph_construction_runtime_s"] = float(t_graph1-t_graph0)
+
+    t_col0 = time.perf_counter()
+    chi, coloring, cross = exact_chromatic_with_crosscheck(G)
+    t_col1 = time.perf_counter()
+    row["exact_coloring_runtime_s"] = float(t_col1-t_col0)
+
+    if not validate_color_classes_commute(events, coloring):
+        raise AssertionError("Exact coloring has anticommuting same-color events")
+
+    t_deep0 = time.perf_counter()
+    deep_validation = (
+        deep_validate_pauli_model(ct, events, G)
+        if RUN_DEEP_PAULI_VALIDATION
+        else {"pass": None}
+    )
+    t_deep1 = time.perf_counter()
+    row["deep_validation_runtime_s"] = float(t_deep1-t_deep0)
+    if RUN_DEEP_PAULI_VALIDATION and deep_validation.get("pass") is False:
+        raise AssertionError(
+            "Deep Pauli-model validation failed; branch is not publication-eligible"
+        )
+
+    cert = coloring_certificate(G, chi, coloring)
+
+    row.update({
+        "analysis_success":True,
+        "claim_eligible":(eq_status == "pass"),
+        "events":len(events),
+        "zero_T_representation":bool(len(events) == 0),
+        "empty_anticommutation_graph":bool(G.number_of_nodes() == 0),
+        "pauli_sequence_hash":pauli_sequence_hash(events),
+        "distinct_paulis":len({e.pauli.label() for e in events}),
+        "graph_nodes":G.number_of_nodes(),
+        "graph_edges":G.number_of_edges(),
+        "graph_density":float(nx.density(G)) if G.number_of_nodes() > 1 else 0.0,
+        "graph_bipartite":bool(nx.is_bipartite(G)) if G.number_of_nodes() else True,
+        "graph_components":int(nx.number_connected_components(G)) if G.number_of_nodes() else 0,
+        "graph_max_degree":int(max((d for _,d in G.degree()), default=0)),
+        "clique_lb":int(clique_lower_bound(G)),
+        "chi":int(chi),
+        "color_classes_commute":True,
+        "sat_crosscheck":cross.get("sat_match"),
+        "backtracking_coloring_runtime_s":cross.get("backtracking_runtime_s"),
+        "sat_calls":cross.get("sat_calls"),
+        "sat_total_runtime_s":cross.get("sat_total_runtime_s"),
+        "sat_chi_variables":cross.get("sat_chi_variables"),
+        "sat_chi_clauses":cross.get("sat_chi_clauses"),
+        "deep_pauli_validation_run":bool(RUN_DEEP_PAULI_VALIDATION),
+        "deep_pauli_validation_pass":deep_validation.get("pass"),
+        "direct_signature_validation_run":
+            deep_validation.get("direct_signature_validation", {}).get("run"),
+        "direct_signature_validation_pass":
+            deep_validation.get("direct_signature_validation", {}).get("all_signature_matches"),
+        "direct_pair_commutation_validation_pass":
+            deep_validation.get("direct_signature_validation", {}).get("all_pair_commutation_matches"),
+        "rotation_reconstruction_run":
+            deep_validation.get("projective_rotation_reconstruction", {}).get("run"),
+        "rotation_reconstruction_pass":
+            deep_validation.get("projective_rotation_reconstruction", {}).get("equivalent_up_to_global_phase"),
+        "full_direct_validation_completed":bool(
+            deep_validation.get("direct_signature_validation", {}).get("run") is True
+            and deep_validation.get("projective_rotation_reconstruction", {}).get("run") is True
+        ),
+        "full_direct_validation_pass":bool(
+            deep_validation.get("direct_signature_validation", {}).get("all_signature_matches") is True
+            and deep_validation.get("direct_signature_validation", {}).get("all_pair_commutation_matches") is True
+            and deep_validation.get("projective_rotation_reconstruction", {}).get("equivalent_up_to_global_phase") is True
+        ) if (
+            deep_validation.get("direct_signature_validation", {}).get("run") is True
+            and deep_validation.get("projective_rotation_reconstruction", {}).get("run") is True
+        ) else None,
+        "clique_size":int(cert["clique_size"]),
+        "hand_checkable_exact_chi":bool(cert["hand_checkable_exact"]),
+        "chi_lower_bound_type":cert["lower_bound_type"],
+    })
+
+    row["branch_analysis_runtime_s"] = float(time.perf_counter()-t_branch0)
+
+    ensure_dir(strategy_dir)
+
+    evdf = event_dataframe(events)
+    # Fixed-schema event_dataframe guarantees this is safe for zero-T branches.
+    evdf["color"] = evdf["event_id"].map(coloring)
+    evdf.to_csv(strategy_dir / "pauli_events.csv", index=False)
+    edge_df.to_csv(strategy_dir / "edge_witnesses.csv", index=False)
+
+    json_dump(strategy_dir / "variant_report.json", {
+        "row":row,
+        "coloring":coloring,
+        "coloring_crosscheck":cross,
+        "coloring_certificate":cert,
+        "deep_pauli_validation":deep_validation,
+        "model_semantics":{
+            "vertices":"explicit T/Tdg events after fixed exact Clifford+T rebase",
+            "pauli_signature":
+                "suffix-Clifford conjugated Z axis, represented modulo overall Pauli sign",
+            "edge":
+                "binary symplectic product 1 (Pauli anticommutation)",
+            "chi":
+                "minimum number of pairwise-commuting Pauli-signature classes",
+            "nonclaim":
+                "chi is not physical T-depth and not executable schedule depth",
+        },
+    })
+
+    if SAVE_GRAPHML:
+        nx.write_graphml(G, strategy_dir / "anticommutation_graph.graphml")
+
+    if SAVE_QASM:
+        try:
+            (strategy_dir / "normalized.qasm").write_text(
+                circuit_to_qasm2(variant), encoding="utf-8"
+            )
+            (strategy_dir / "rebased_ct.qasm").write_text(
+                circuit_to_qasm2(ct), encoding="utf-8"
+            )
+        except Exception:
+            pass
+
+    return row, G
+
+# =============================================================================
+# Circuit-level aggregation
+# =============================================================================
+
+def build_circuit_summary(df: pd.DataFrame,
+                          graphs: Dict[Tuple[str,str], nx.Graph]) -> pd.DataFrame:
     if df.empty:
-        return df, pd.DataFrame(), pd.DataFrame()
-    valid = df[(df["analysis_success"] == True) & (df["equiv_status"].isin(["pass"])) & (~df["Lstar"].isna())].copy()
+        return pd.DataFrame()
+
+    valid = df[
+        (df["analysis_success"] == True) &
+        (df["equiv_status"] == "pass")
+    ].copy()
+
     rows = []
+
     for cid, g in valid.groupby("circuit_id"):
         fam = g["family"].iloc[0]
-        n = int(g["n"].iloc[0])
-        Ls = sorted(set(int(x) for x in g["Lstar"].dropna().tolist()))
-        hashes = sorted(set(str(x) for x in g["g_hash"].dropna().tolist()))
-        tws = [x for x in g["g_treewidth_minfill"].dropna().tolist()]
-        clauses = [x for x in g["sat_clauses"].dropna().tolist()]
-        tcounts = [x for x in g["t_count"].dropna().tolist()]
-        if len(g) < 2:
-            case = "insufficient_equivalent_variants"
-        elif len(Ls) > 1:
-            case = "Lstar_sensitive"
-        elif len(hashes) > 1:
-            case = "graph_varies_Lstar_stable"
-        else:
-            case = "graph_and_Lstar_stable"
+
+        graph_items = []
+        for _, r in g.iterrows():
+            key = (cid, str(r["strategy"]))
+            if key in graphs:
+                graph_items.append((str(r["strategy"]), graphs[key]))
+
+        class_map = exact_graph_classes(graph_items) if graph_items else {}
+
+        for idx, r in g.iterrows():
+            strat = str(r["strategy"])
+            df.loc[idx, "graph_iso_class"] = class_map.get(strat)
+
+        chis = sorted(set(int(x) for x in g["chi"].tolist()))
+        tcounts = sorted(set(int(x) for x in g["ct_t_count"].tolist()))
+        iso_classes = sorted(set(int(x) for x in class_map.values()))
+
+        # T-count-matched chromatic sensitivity.
+        matched_sensitive = False
+        matched_pairs = 0
+        matched_graph_sensitive = False
+
+        for tc, gt in g.groupby("ct_t_count"):
+            vals = sorted(set(int(x) for x in gt["chi"].tolist()))
+            if len(vals) > 1:
+                matched_sensitive = True
+
+            strats = list(gt["strategy"].astype(str))
+            for a, b in itertools.combinations(strats, 2):
+                matched_pairs += 1
+                Ga = graphs.get((cid, a))
+                Gb = graphs.get((cid, b))
+                if Ga is not None and Gb is not None:
+                    if not nx.is_isomorphic(Ga, Gb):
+                        matched_graph_sensitive = True
+
+        pyzx = g[g["tool"] == "pyzx"].copy()
+        pyzx_chis = sorted(set(int(x) for x in pyzx["chi"].tolist())) if not pyzx.empty else []
+        pyzx_graph_items = [
+            (str(r["strategy"]), graphs[(cid, str(r["strategy"]))])
+            for _, r in pyzx.iterrows()
+            if (cid, str(r["strategy"])) in graphs
+        ]
+        pyzx_classes = exact_graph_classes(pyzx_graph_items) if pyzx_graph_items else {}
+
         rows.append({
-            "circuit_id": cid,
-            "family": fam,
-            "n": n,
-            "valid_variants": int(len(g)),
-            "strategies_valid": ";".join(sorted(g["strategy"].astype(str).tolist())),
-            "case_class": case,
-            "min_Lstar": min(Ls) if Ls else None,
-            "max_Lstar": max(Ls) if Ls else None,
-            "var_Lstar": (max(Ls)-min(Ls)) if Ls else None,
-            "distinct_Lstar": len(Ls),
-            "distinct_graph_hashes": len(hashes),
-            "min_treewidth": min(tws) if tws else None,
-            "max_treewidth": max(tws) if tws else None,
-            "var_treewidth": (max(tws)-min(tws)) if tws else None,
-            "min_sat_clauses": min(clauses) if clauses else None,
-            "max_sat_clauses": max(clauses) if clauses else None,
-            "var_sat_clauses": (max(clauses)-min(clauses)) if clauses else None,
-            "min_t_count": min(tcounts) if tcounts else None,
-            "max_t_count": max(tcounts) if tcounts else None,
-            "var_t_count": (max(tcounts)-min(tcounts)) if tcounts else None,
+            "circuit_id":cid,
+            "family":fam,
+            "valid_variants":int(len(g)),
+            "valid_pyzx_variants":int(len(pyzx)),
+            "distinct_T_counts":len(tcounts),
+            "min_T_count":min(tcounts) if tcounts else None,
+            "max_T_count":max(tcounts) if tcounts else None,
+            "distinct_graph_iso_classes":len(iso_classes),
+            "distinct_chi":len(chis),
+            "min_chi":min(chis) if chis else None,
+            "max_chi":max(chis) if chis else None,
+            "chromatic_sensitive":len(chis) > 1,
+            "graph_sensitive":len(iso_classes) > 1,
+            "T_count_matched_chromatic_sensitive":bool(matched_sensitive),
+            "T_count_matched_graph_sensitive":bool(matched_graph_sensitive),
+            "T_count_matched_pairs_checked":int(matched_pairs),
+            "pyzx_distinct_graph_classes":len(set(pyzx_classes.values())) if pyzx_classes else 0,
+            "pyzx_distinct_chi":len(pyzx_chis),
+            "pyzx_chromatic_sensitive":len(pyzx_chis) > 1,
+            "pyzx_graph_sensitive":len(set(pyzx_classes.values())) > 1 if pyzx_classes else False,
         })
-    summary = pd.DataFrame(rows)
 
-    fam_rows = []
-    if not summary.empty:
-        for fam, g in summary.groupby("family"):
-            fam_rows.append({
-                "family": fam,
-                "circuits": int(len(g)),
-                "Lstar_sensitive": int((g["case_class"] == "Lstar_sensitive").sum()),
-                "graph_varies_Lstar_stable": int((g["case_class"] == "graph_varies_Lstar_stable").sum()),
-                "graph_and_Lstar_stable": int((g["case_class"] == "graph_and_Lstar_stable").sum()),
-                "insufficient": int((g["case_class"] == "insufficient_equivalent_variants").sum()),
-                "sensitivity_rate": float((g["case_class"] == "Lstar_sensitive").mean()),
-                "mean_var_Lstar": float(g["var_Lstar"].fillna(0).mean()),
-                "max_var_Lstar": int(g["var_Lstar"].fillna(0).max()),
-                "mean_distinct_graph_hashes": float(g["distinct_graph_hashes"].fillna(0).mean()),
-                "max_var_sat_clauses": int(g["var_sat_clauses"].fillna(0).max()),
-            })
-    fam_summary = pd.DataFrame(fam_rows).sort_values(["sensitivity_rate", "max_var_Lstar"], ascending=False) if fam_rows else pd.DataFrame()
+    return pd.DataFrame(rows)
 
-    # Counterexamples: choose one low-L and one high-L strategy for every sensitive circuit.
-    ce_rows = []
-    for _, srow in summary[summary["case_class"] == "Lstar_sensitive"].iterrows() if not summary.empty else []:
-        cid = srow["circuit_id"]
-        g = valid[valid["circuit_id"] == cid].copy()
-        g_low = g.sort_values(["Lstar", "t_count", "sat_clauses"]).iloc[0]
-        g_high = g.sort_values(["Lstar", "t_count", "sat_clauses"], ascending=[False, False, False]).iloc[0]
-        ce_rows.append({
-            "circuit_id": cid,
-            "family": srow["family"],
-            "n": srow["n"],
-            "low_strategy": g_low["strategy"],
-            "low_Lstar": int(g_low["Lstar"]),
-            "low_t_count": int(g_low["t_count"]),
-            "low_graph_hash": g_low["g_hash"],
-            "high_strategy": g_high["strategy"],
-            "high_Lstar": int(g_high["Lstar"]),
-            "high_t_count": int(g_high["t_count"]),
-            "high_graph_hash": g_high["g_hash"],
-            "delta_Lstar": int(g_high["Lstar"] - g_low["Lstar"]),
-            "delta_t_count": int(g_high["t_count"] - g_low["t_count"]),
-            "low_sat_clauses": int(g_low["sat_clauses"]),
-            "high_sat_clauses": int(g_high["sat_clauses"]),
-        })
-    counterexamples = pd.DataFrame(ce_rows).sort_values(["delta_Lstar", "n"], ascending=[False, True]) if ce_rows else pd.DataFrame()
-    return summary, fam_summary, counterexamples
+def build_matched_pair_table(df: pd.DataFrame,
+                             graphs: Dict[Tuple[str,str], nx.Graph]) -> pd.DataFrame:
+    valid = df[
+        (df["analysis_success"] == True) &
+        (df["equiv_status"] == "pass")
+    ].copy()
 
+    rows = []
 
+    for cid, g in valid.groupby("circuit_id"):
+        fam = g["family"].iloc[0]
 
-def strategy_health_report(df: pd.DataFrame) -> pd.DataFrame:
-    """Backend/strategy health over all attempts, including failed ones.
+        for tc, gt in g.groupby("ct_t_count"):
+            recs = list(gt.to_dict("records"))
 
-    This table is intentionally not restricted to equivalence-pass variants. It
-    documents optional backends and failed normalization branches so that the
-    experimental evidence cannot be mistaken for cherry-picked successes.
-    """
-    if df.empty or "strategy" not in df.columns:
+            for a, b in itertools.combinations(recs, 2):
+                sa = str(a["strategy"])
+                sb = str(b["strategy"])
+                Ga = graphs.get((cid, sa))
+                Gb = graphs.get((cid, sb))
+                if Ga is None or Gb is None:
+                    continue
+
+                iso = nx.is_isomorphic(Ga, Gb)
+
+                rows.append({
+                    "circuit_id":cid,
+                    "family":fam,
+                    "T_count":int(tc),
+                    "strategy_a":sa,
+                    "tool_a":a["tool"],
+                    "chi_a":int(a["chi"]),
+                    "edges_a":int(a["graph_edges"]),
+                    "paulis_a":int(a["distinct_paulis"]),
+                    "strategy_b":sb,
+                    "tool_b":b["tool"],
+                    "chi_b":int(b["chi"]),
+                    "edges_b":int(b["graph_edges"]),
+                    "paulis_b":int(b["distinct_paulis"]),
+                    "graphs_isomorphic":bool(iso),
+                    "graph_sensitive":not iso,
+                    "chromatic_sensitive":int(a["chi"]) != int(b["chi"]),
+                    "delta_chi":abs(int(a["chi"]) - int(b["chi"])),
+                    "both_pyzx":(a["tool"] == "pyzx" and b["tool"] == "pyzx"),
+                })
+
+    return pd.DataFrame(rows)
+
+def build_witness_candidates(pair_df: pd.DataFrame,
+                             variant_df: pd.DataFrame) -> pd.DataFrame:
+    if pair_df.empty:
         return pd.DataFrame()
+
+    cand = pair_df[
+        (pair_df["chromatic_sensitive"] == True) |
+        (pair_df["graph_sensitive"] == True)
+    ].copy()
+
+    if cand.empty:
+        return pd.DataFrame()
+
+    # Prefer:
+    # 1) T-count-matched chromatic sensitivity
+    # 2) both PyZX
+    # 3) lower T-count
+    # 4) lower graph size
+    cand["priority_score"] = (
+        cand["chromatic_sensitive"].astype(int) * 1000000 +
+        cand["both_pyzx"].astype(int) * 100000 -
+        cand["T_count"].astype(int) * 100 -
+        (cand["edges_a"] + cand["edges_b"]).astype(int)
+    )
+
+    return cand.sort_values(
+        ["priority_score", "delta_chi", "T_count"],
+        ascending=[False, False, True]
+    ).head(TOP_WITNESSES)
+
+# =============================================================================
+# Strategy diagnostics
+# =============================================================================
+
+def strategy_health(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame()
+
     rows = []
     for strat, g in df.groupby("strategy"):
-        total = len(g)
-        norm_success = int(g.get("norm_success", pd.Series([False]*total)).fillna(False).astype(bool).sum())
-        analysis_success = int(g.get("analysis_success", pd.Series([False]*total)).fillna(False).astype(bool).sum())
-        eq_pass = int((g.get("equiv_status", pd.Series([""]*total)).astype(str) == "pass").sum())
-        eq_fail = int((g.get("equiv_status", pd.Series([""]*total)).astype(str) == "fail").sum())
-        cats = Counter(g.get("failure_category", pd.Series(["none"]*total)).fillna("none").astype(str).tolist())
         rows.append({
-            "strategy": strat,
-            "attempts": int(total),
-            "norm_success": norm_success,
-            "analysis_success": analysis_success,
-            "equiv_pass": eq_pass,
-            "equiv_fail": eq_fail,
-            "norm_success_rate": float(norm_success/total) if total else 0.0,
-            "analysis_success_rate": float(analysis_success/total) if total else 0.0,
-            "equiv_pass_rate": float(eq_pass/total) if total else 0.0,
-            "failure_categories_json": json.dumps(dict(sorted(cats.items())), sort_keys=True),
+            "strategy":strat,
+            "tool":g["tool"].iloc[0],
+            "attempts":len(g),
+            "norm_success":int(g["norm_success"].fillna(False).astype(bool).sum()),
+            "equiv_pass":int((g["equiv_status"] == "pass").sum()),
+            "equiv_fail":int((g["equiv_status"] == "fail").sum()),
+            "equiv_unknown":int((g["equiv_status"] == "unknown").sum()),
+            "analysis_success":int(g["analysis_success"].fillna(False).astype(bool).sum()),
+            "claim_eligible":int(g.get("claim_eligible", pd.Series([False]*len(g))).fillna(False).astype(bool).sum()),
         })
-    return pd.DataFrame(rows).sort_values(["equiv_pass_rate", "analysis_success_rate", "strategy"], ascending=[False, False, True])
 
+    return pd.DataFrame(rows).sort_values(["tool","strategy"])
 
-def export_counterexample_artifacts(outdir: Path, counterexamples: pd.DataFrame) -> None:
-    """Create a small inspection counterexample bundle.
+def distinct_representation_diagnostics(df: pd.DataFrame) -> pd.DataFrame:
+    valid = df[
+        (df["analysis_success"] == True) &
+        (df["equiv_status"] == "pass")
+    ].copy()
 
-    The original per-instance artifacts remain in instances/<circuit_id>. This
-    function writes an index and copies the low/high normalized QASM/GraphML/PNG
-    artifacts when present.
-    """
-    if counterexamples is None or counterexamples.empty:
-        return
-    root = outdir / "counterexample_artifacts"
-    ensure_dir(root)
-    index = []
-    for _, r in counterexamples.head(50).iterrows():
-        cid = str(r.get("circuit_id"))
-        cdir = root / safe_name(cid)
-        ensure_dir(cdir)
-        src_inst = outdir / "instances" / cid
-        rec = dict(r)
-        for label, strat_key in [("low", "low_strategy"), ("high", "high_strategy")]:
-            strat = safe_name(str(r.get(strat_key)))
-            for ext in ["qasm", "graphml", "_depgraph.png", "_graph_metrics.json"]:
-                fn = f"{strat}.{ext}" if not ext.startswith("_") else f"{strat}{ext}"
-                sp = src_inst / fn
-                if sp.exists():
-                    dp = cdir / f"{label}_{fn}"
-                    try:
-                        shutil.copy2(sp, dp)
-                        rec[f"{label}_{ext}_artifact"] = str(dp.relative_to(outdir))
-                    except Exception:
-                        pass
-        op = src_inst / "original_transpiled.qasm"
-        if op.exists():
-            try:
-                shutil.copy2(op, cdir / "original_transpiled.qasm")
-                rec["original_artifact"] = str((cdir / "original_transpiled.qasm").relative_to(outdir))
-            except Exception:
-                pass
-        json_dump(cdir / "counterexample_record.json", rec)
-        index.append(rec)
-    pd.DataFrame(index).to_csv(root / "counterexample_artifact_index.csv", index=False)
-
-
-def strategy_level_summary(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty or "strategy" not in df.columns:
+    if valid.empty:
         return pd.DataFrame()
-    d = df[(df.get("analysis_success", False) == True) & (df.get("equiv_status", "") == "pass")].copy()
-    if d.empty:
-        return pd.DataFrame()
+
     rows = []
-    for strat, g in d.groupby("strategy"):
+
+    for cid, g in valid.groupby("circuit_id"):
         rows.append({
-            "strategy": strat,
-            "variants": int(len(g)),
-            "families": int(g["family"].nunique()) if "family" in g else 0,
-            "median_Lstar": float(g["Lstar"].median()) if "Lstar" in g else None,
-            "mean_Lstar": float(g["Lstar"].mean()) if "Lstar" in g else None,
-            "median_t_count": float(g["t_count"].median()) if "t_count" in g else None,
-            "median_sat_clauses": float(g["sat_clauses"].median()) if "sat_clauses" in g else None,
-            "median_treewidth": float(g["g_treewidth_minfill"].median()) if "g_treewidth_minfill" in g else None,
-            "mean_phase_edges": float(g["phase_interaction_edges"].mean()) if "phase_interaction_edges" in g else None,
-            "mean_dep_controlled_fraction": float(g["dep_edges_controlled_fraction"].mean()) if "dep_edges_controlled_fraction" in g else None,
-            "mean_sat_decisions": float(g["sat_decisions"].mean()) if "sat_decisions" in g else None,
+            "circuit_id":cid,
+            "family":g["family"].iloc[0],
+            "strategy_labels":int(g["strategy"].nunique()),
+            "distinct_variant_hashes":int(g["variant_hash"].nunique()),
+            "distinct_pauli_sequences":int(g["pauli_sequence_hash"].nunique()),
+            "distinct_T_counts":int(g["ct_t_count"].nunique()),
+            "distinct_chi":int(g["chi"].nunique()),
         })
-    return pd.DataFrame(rows).sort_values(["median_Lstar", "median_sat_clauses", "strategy"], ascending=[True, True, True])
+
+    return pd.DataFrame(rows)
 
 
-def explanatory_delta_summary(df: pd.DataFrame) -> pd.DataFrame:
-    """For every L*-sensitive circuit, compare the lowest-L* and highest-L* variants."""
+
+def failure_forensics(df: pd.DataFrame) -> pd.DataFrame:
+    """Reviewer-facing exhaustive accounting of every non-success branch."""
     if df.empty:
         return pd.DataFrame()
-    valid = df[(df.get("analysis_success", False) == True) & (df.get("equiv_status", "") == "pass") & (~df.get("Lstar", pd.Series(dtype=float)).isna())].copy()
+
+    bad = df[
+        ~(
+            (df.get("analysis_success", False) == True) &
+            (df.get("equiv_status", "") == "pass")
+        )
+    ].copy()
+
+    if bad.empty:
+        return pd.DataFrame(columns=[
+            "strategy", "tool", "failure_category", "trace_failure_stage",
+            "attempts", "example_error"
+        ])
+
+    rows = []
+    for (strategy, tool, cat), g in bad.groupby(
+        ["strategy", "tool", "failure_category"], dropna=False
+    ):
+        stages = Counter()
+        for x in g.get("norm_trace_json", pd.Series(dtype=str)).dropna().astype(str):
+            try:
+                obj = json.loads(x)
+                stages[str(obj.get("failure_stage", "unknown"))] += 1
+            except Exception:
+                stages["trace_unparseable"] += 1
+
+        err_series = []
+        for col in ["norm_error", "analysis_error"]:
+            if col in g:
+                err_series.extend(
+                    [str(x) for x in g[col].dropna().tolist() if str(x)]
+                )
+
+        rows.append({
+            "strategy":strategy,
+            "tool":tool,
+            "failure_category":cat,
+            "trace_failure_stage_hist_json":json.dumps(dict(stages), sort_keys=True),
+            "attempts":int(len(g)),
+            "example_error":err_series[0][:1000] if err_series else "",
+        })
+
+    return pd.DataFrame(rows).sort_values(
+        ["tool", "strategy", "failure_category"]
+    )
+
+
+
+def unique_outcome_summary(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Prevent pseudo-replication: repeated strategy labels that produce the same
+    representation/Pauli graph are not counted as independent scientific
+    outcomes.
+    """
+    valid = df[
+        (df["analysis_success"] == True) &
+        (df["equiv_status"] == "pass")
+    ].copy()
+
+    if valid.empty:
+        return pd.DataFrame()
+
+    rows = []
+    for (cid, tool), g in valid.groupby(["circuit_id", "tool"]):
+        rows.append({
+            "circuit_id":cid,
+            "family":g["family"].iloc[0],
+            "tool":tool,
+            "strategy_labels":int(g["strategy"].nunique()),
+            "unique_variant_hashes":int(g["variant_hash"].nunique()),
+            "unique_pauli_sequences":int(g["pauli_sequence_hash"].nunique()),
+            "unique_T_counts":int(g["ct_t_count"].nunique()),
+            "unique_chi_values":int(g["chi"].nunique()),
+            "strategies_json":json.dumps(sorted(g["strategy"].astype(str).tolist())),
+        })
+    return pd.DataFrame(rows)
+
+
+def canonical_primary_witness(pair_df: pd.DataFrame,
+                              variant_df: pd.DataFrame) -> Optional[Dict[str, Any]]:
+    """
+    Select ONE primary witness, avoiding pair-count inflation.
+    Preference:
+      1) both PyZX,
+      2) same T-count (pair table guarantees this),
+      3) chromatic sensitivity,
+      4) hand-checkable exact chi on both branches,
+      5) smallest T-count / graph.
+    """
+    if pair_df.empty:
+        return None
+
+    cand = pair_df[
+        (pair_df["both_pyzx"] == True) &
+        (pair_df["chromatic_sensitive"] == True)
+    ].copy()
+
+    if cand.empty:
+        return None
+
+    lookup = variant_df.set_index(["circuit_id", "strategy"], drop=False)
+
+    enriched = []
+    for r in cand.to_dict("records"):
+        try:
+            a = lookup.loc[(r["circuit_id"], r["strategy_a"])]
+            b = lookup.loc[(r["circuit_id"], r["strategy_b"])]
+            if isinstance(a, pd.DataFrame): a = a.iloc[0]
+            if isinstance(b, pd.DataFrame): b = b.iloc[0]
+        except Exception:
+            continue
+
+        hand = bool(a.get("hand_checkable_exact_chi", False)) and \
+               bool(b.get("hand_checkable_exact_chi", False))
+        deep = bool(a.get("deep_pauli_validation_pass", False)) and \
+               bool(b.get("deep_pauli_validation_pass", False))
+        full_direct = bool(a.get("full_direct_validation_pass", False)) and \
+                      bool(b.get("full_direct_validation_pass", False))
+
+        rr = dict(r)
+        rr["both_hand_checkable_exact"] = hand
+        rr["both_deep_validated"] = deep
+        rr["both_full_direct_validated"] = full_direct
+        rr["size_score"] = int(r["T_count"]) + int(r["edges_a"]) + int(r["edges_b"])
+        enriched.append(rr)
+
+    if not enriched:
+        return None
+
+    edf = pd.DataFrame(enriched)
+    edf = edf.sort_values(
+        ["both_full_direct_validated", "both_deep_validated",
+         "both_hand_checkable_exact", "size_score",
+         "strategy_a", "strategy_b"],
+        ascending=[False, False, False, True, True, True]
+    )
+    return edf.iloc[0].to_dict()
+
+
+def write_primary_witness_bundle(pair_df: pd.DataFrame,
+                                 variant_df: pd.DataFrame,
+                                 output_dir: Path) -> Optional[Dict[str, Any]]:
+    w = canonical_primary_witness(pair_df, variant_df)
+    if w is None:
+        return None
+
+    cid = str(w["circuit_id"])
+    sa = str(w["strategy_a"])
+    sb = str(w["strategy_b"])
+    wdir = output_dir / "PRIMARY_WITNESS"
+    ensure_dir(wdir)
+
+    # Copy data by re-reading the already written audit artifacts.
+    source_base = output_dir / "instances" / cid
+    branch_data = {}
+
+    for label, strat in [("A", sa), ("B", sb)]:
+        sdir = source_base / safe_name(strat)
+        rep = json.load(open(sdir / "variant_report.json", encoding="utf-8"))
+        try:
+            ev = pd.read_csv(sdir / "pauli_events.csv")
+        except pd.errors.EmptyDataError:
+            ev = pd.DataFrame(columns=EVENT_DF_COLUMNS)
+        try:
+            ed = pd.read_csv(sdir / "edge_witnesses.csv")
+        except pd.errors.EmptyDataError:
+            ed = pd.DataFrame(columns=EDGE_DF_COLUMNS)
+
+        ev.to_csv(wdir / f"{label}_pauli_events.csv", index=False)
+        ed.to_csv(wdir / f"{label}_edge_witnesses.csv", index=False)
+
+        for qasm_name in ["normalized.qasm", "rebased_ct.qasm"]:
+            srcp = sdir / qasm_name
+            if srcp.exists():
+                (wdir / f"{label}_{qasm_name}").write_text(
+                    srcp.read_text(encoding="utf-8", errors="ignore"),
+                    encoding="utf-8"
+                )
+
+        branch_data[label] = {
+            "strategy":strat,
+            "row":rep.get("row", {}),
+            "coloring_certificate":rep.get("coloring_certificate", {}),
+            "deep_pauli_validation":rep.get("deep_pauli_validation", {}),
+        }
+
+    # Explicit lower-bound witness details.
+    summary = {
+        "circuit_id":cid,
+        "family":w.get("family"),
+        "T_count":int(w["T_count"]),
+        "strategy_A":sa,
+        "strategy_B":sb,
+        "chi_A":int(w["chi_a"]),
+        "chi_B":int(w["chi_b"]),
+        "graphs_isomorphic":bool(w["graphs_isomorphic"]),
+        "claim":
+            "same original circuit + two semantics-preserving PyZX normalizations "
+            "+ equal exact post-rebase T-count -> different Pauli anticommutation "
+            "graphs and different exact chromatic numbers",
+        "interpretation_guard":
+            "chromatic number is a commuting-class partition number, not physical T-depth",
+        "branches":branch_data,
+    }
+
+    json_dump(wdir / "witness_summary.json", summary)
+
+    # Human-readable short certificate table.
+    cert_rows = []
+    for label in ["A", "B"]:
+        c = branch_data[label]["coloring_certificate"]
+        cert_rows.append({
+            "branch":label,
+            "strategy":branch_data[label]["strategy"],
+            "chi":c.get("chi"),
+            "clique_size":c.get("clique_size"),
+            "maximum_clique_witness":json.dumps(c.get("maximum_clique_witness", [])),
+            "proper_coloring_valid":c.get("proper_coloring_valid"),
+            "hand_checkable_exact":c.get("hand_checkable_exact"),
+            "lower_bound_type":c.get("lower_bound_type"),
+        })
+    pd.DataFrame(cert_rows).to_csv(
+        wdir / "hand_checkable_chromatic_certificates.csv", index=False
+    )
+    return summary
+
+
+# =============================================================================
+# Reviewer-complete robustness / coverage analyses
+# =============================================================================
+
+FAMILY_DICTIONARY = {
+    "BV":"Bernstein-Vazirani-like phase/oracle circuits",
+    "Path":"QAOA on path graphs",
+    "Ring":"QAOA on cycle/ring graphs",
+    "Star":"QAOA on star graphs",
+    "TOF":"Toffoli-chain circuits",
+    "ER":"QAOA on Erdos-Renyi graphs",
+    "ADD":"modular-adder proxy circuits",
+    "RA":"RealAmplitudes-like ansatz circuits on the exact pi/4 grid",
+    "RICT":"random interaction Clifford+T-grid circuits",
+    "IQP":"commuting IQP-like phase circuits",
+    "VQE":"EfficientSU2-like VQE ansatz circuits on the exact pi/4 grid",
+    "PP":"phase-polynomial stress circuits",
+    "BA":"QAOA on Barabasi-Albert graphs",
+    "RCT":"random Clifford+T circuits",
+    "RR":"QAOA on random-regular graphs",
+    "RCNOTT":"random CNOT+T-layered circuits",
+    "BRICK":"brickwork Clifford+T circuits",
+    "CPL":"controlled-phase-ladder circuits",
+    "DENSE":"dense pair-interaction phase circuits",
+    "QFT":"QFT-like phase-interaction circuits",
+    "K4":"fixed four-qubit complete-interaction motif circuits",
+    "HEA":"hardware-efficient ansatz circuits",
+}
+
+def write_family_dictionary(outdir: Path) -> None:
+    pd.DataFrame([
+        {"family":k, "description":v}
+        for k,v in sorted(FAMILY_DICTIONARY.items())
+    ]).to_csv(outdir / "family_dictionary.csv", index=False)
+
+
+def strategy_pair_disagreement_matrix(pair_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Same-T-count comparisons only.  Reports whether sensitivity is broadly
+    distributed across strategy pairs or concentrated in a single comparison.
+    """
+    if pair_df.empty:
+        return pd.DataFrame()
+
+    rows = []
+    tmp = pair_df.copy()
+    for _, r in tmp.iterrows():
+        a,b = sorted([str(r["strategy_a"]), str(r["strategy_b"])])
+        rows.append({
+            "strategy_1":a,
+            "strategy_2":b,
+            "both_pyzx":bool(r["both_pyzx"]),
+            "graph_sensitive":bool(r["graph_sensitive"]),
+            "chromatic_sensitive":bool(r["chromatic_sensitive"]),
+        })
+    d = pd.DataFrame(rows)
+
+    return d.groupby(
+        ["strategy_1","strategy_2","both_pyzx"]
+    ).agg(
+        matched_T_pairs=("graph_sensitive","count"),
+        graph_sensitive_pairs=("graph_sensitive","sum"),
+        chromatic_sensitive_pairs=("chromatic_sensitive","sum"),
+    ).reset_index().assign(
+        graph_sensitive_rate=lambda x:
+            x["graph_sensitive_pairs"]/x["matched_T_pairs"],
+        chromatic_sensitive_rate=lambda x:
+            x["chromatic_sensitive_pairs"]/x["matched_T_pairs"],
+    )
+
+
+def strategy_saturation_analysis(variant_df: pd.DataFrame,
+                                 permutations: int = SATURATION_PERMUTATIONS) -> pd.DataFrame:
+    """
+    Empirical answer to Reviewer #1's 'have enough normalization strategies
+    been explored?' question.
+
+    For each circuit and each k, randomize the order of its valid PyZX
+    strategies and record cumulative observed:
+      - distinct exact graph-isomorphism classes,
+      - distinct chi values,
+      - distinct normalized-representation hashes.
+
+    This does NOT prove exhaustive coverage.  It quantifies empirical
+    saturation of the predeclared strategy set.
+    """
+    if variant_df.empty or "graph_iso_class" not in variant_df.columns:
+        return pd.DataFrame()
+
+    valid = variant_df[
+        (variant_df["analysis_success"] == True) &
+        (variant_df["equiv_status"] == "pass") &
+        (variant_df["tool"] == "pyzx")
+    ].copy()
+
+    rng = random.Random(ANALYSIS_RANDOM_SEED)
+    rows = []
+
+    for cid, g in valid.groupby("circuit_id"):
+        recs = g[[
+            "strategy","graph_iso_class","chi","variant_hash"
+        ]].drop_duplicates("strategy").to_dict("records")
+        m = len(recs)
+        if m == 0:
+            continue
+
+        accum = {k: {"graph":[], "chi":[], "repr":[]} for k in range(1,m+1)}
+
+        # Deterministic base ordering plus randomized permutations.
+        orders = [list(range(m))]
+        for _ in range(int(permutations)):
+            order = list(range(m))
+            rng.shuffle(order)
+            orders.append(order)
+
+        for order in orders:
+            seen_g, seen_c, seen_r = set(), set(), set()
+            for kk, idxr in enumerate(order, start=1):
+                rr = recs[idxr]
+                seen_g.add(str(rr["graph_iso_class"]))
+                seen_c.add(int(rr["chi"]))
+                seen_r.add(str(rr["variant_hash"]))
+                accum[kk]["graph"].append(len(seen_g))
+                accum[kk]["chi"].append(len(seen_c))
+                accum[kk]["repr"].append(len(seen_r))
+
+        fam = g["family"].iloc[0]
+        for k in range(1,m+1):
+            for metric, key in [
+                ("graph_classes","graph"),
+                ("chi_values","chi"),
+                ("representations","repr"),
+            ]:
+                vals = np.asarray(accum[k][key], dtype=float)
+                rows.append({
+                    "circuit_id":cid,
+                    "family":fam,
+                    "k_strategies":int(k),
+                    "available_pyzx_strategies":int(m),
+                    "metric":metric,
+                    "mean":float(vals.mean()),
+                    "std":float(vals.std(ddof=0)),
+                    "min":float(vals.min()),
+                    "max":float(vals.max()),
+                    "permutations":int(len(vals)),
+                })
+
+    return pd.DataFrame(rows)
+
+
+def leave_one_strategy_out_analysis(variant_df: pd.DataFrame,
+                                    graphs: Dict[Tuple[str,str], nx.Graph]) -> pd.DataFrame:
+    """
+    Robustness check: does a circuit's same-T-count chromatic sensitivity
+    disappear when one PyZX strategy is removed?
+    """
+    valid = variant_df[
+        (variant_df["analysis_success"] == True) &
+        (variant_df["equiv_status"] == "pass") &
+        (variant_df["tool"] == "pyzx")
+    ].copy()
+
     rows = []
     for cid, g in valid.groupby("circuit_id"):
-        Ls = sorted(set(int(x) for x in g["Lstar"].dropna().tolist()))
-        if len(Ls) <= 1:
-            continue
-        low = g.sort_values(["Lstar", "t_count", "sat_clauses"]).iloc[0]
-        high = g.sort_values(["Lstar", "t_count", "sat_clauses"], ascending=[False, False, False]).iloc[0]
-        def diff(col):
-            try: return float(high.get(col, 0) or 0) - float(low.get(col, 0) or 0)
-            except Exception: return None
-        rows.append({
-            "circuit_id": cid,
-            "family": low.get("family"),
-            "n": low.get("n"),
-            "low_strategy": low.get("strategy"),
-            "high_strategy": high.get("strategy"),
-            "delta_Lstar": diff("Lstar"),
-            "delta_t_count": diff("t_count"),
-            "delta_naive_tdepth": diff("naive_tdepth"),
-            "delta_sat_clauses": diff("sat_clauses"),
-            "delta_sat_vars": diff("sat_vars"),
-            "delta_treewidth": diff("g_treewidth_minfill"),
-            "delta_edges": diff("g_edges"),
-            "delta_phase_edges": diff("phase_interaction_edges"),
-            "delta_phase_active_wires": diff("phase_proxy_active_wires"),
-            "delta_phase_var_per_wire": diff("phase_proxy_var_per_wire"),
-            "delta_dep_target_line_edges": diff("dep_edges_target_line"),
-            "delta_dep_controlled_fraction": diff("dep_edges_controlled_fraction"),
-            "low_graph_hash": low.get("g_hash"),
-            "high_graph_hash": high.get("g_hash"),
-        })
-    return pd.DataFrame(rows).sort_values(["delta_Lstar", "delta_sat_clauses"], ascending=[False, False]) if rows else pd.DataFrame()
-
-
-def stable_negative_cases(df: pd.DataFrame) -> pd.DataFrame:
-    """List stable and graph-sensitive-but-L*-stable cases as explicit negative controls."""
-    if df.empty:
-        return pd.DataFrame()
-    valid = df[(df.get("analysis_success", False) == True) & (df.get("equiv_status", "") == "pass") & (~df.get("Lstar", pd.Series(dtype=float)).isna())].copy()
-    rows=[]
-    for cid,g in valid.groupby("circuit_id"):
-        Ls = sorted(set(int(x) for x in g["Lstar"].dropna().tolist()))
-        hashes = sorted(set(str(x) for x in g["g_hash"].dropna().tolist()))
-        if len(g) < 2 or len(Ls) != 1:
-            continue
-        case = "graph_varies_Lstar_stable" if len(hashes)>1 else "graph_and_Lstar_stable"
-        rows.append({
-            "circuit_id":cid, "family":g["family"].iloc[0], "n":int(g["n"].iloc[0]),
-            "case_class":case, "Lstar":Ls[0], "valid_variants":len(g),
-            "distinct_graph_hashes":len(hashes), "min_t_count":int(g["t_count"].min()),
-            "max_t_count":int(g["t_count"].max()), "min_sat_clauses":int(g["sat_clauses"].min()),
-            "max_sat_clauses":int(g["sat_clauses"].max()),
-        })
-    return pd.DataFrame(rows).sort_values(["case_class","family","n"]) if rows else pd.DataFrame()
-
-
-
-
-
-# ---------------------------------------------------------------------------
-# V6 mechanistic/explanatory summaries
-# ---------------------------------------------------------------------------
-
-def _json_counter_field(series: pd.Series) -> Counter:
-    c = Counter()
-    for x in series.dropna().astype(str).tolist():
-        try:
-            obj = json.loads(x)
-            if isinstance(obj, dict):
-                for k, v in obj.items():
-                    try: c[str(k)] += int(v)
-                    except Exception: c[str(k)] += 1
-        except Exception:
-            continue
-    return c
-
-
-def rewrite_provenance_summary(df: pd.DataFrame, circuit_summary: pd.DataFrame) -> pd.DataFrame:
-    """Aggregate rewrite/normalization provenance by family, strategy, and case class.
-
-    This is a V6 explanatory layer: it does not merely report that a circuit is
-    sensitive, but correlates sensitivity with the kinds of normalization steps
-    recorded in the strategy trace (full_reduce, clifford_simp, pivot, lcomp,
-    teleport_reduce, random_mix, etc.).
-    """
-    if df.empty or circuit_summary is None or circuit_summary.empty:
-        return pd.DataFrame()
-    cs = circuit_summary[["circuit_id", "case_class"]].drop_duplicates()
-    d = df.merge(cs, on="circuit_id", how="left")
-    d = d[(d.get("analysis_success", False) == True) & (d.get("equiv_status", "") == "pass")].copy()
-    if d.empty:
-        return pd.DataFrame()
-    rows=[]
-    for keys, g in d.groupby(["case_class", "family", "strategy", "norm_tool", "norm_mode"], dropna=False):
-        case, fam, strat, tool, mode = keys
-        op_counts = _json_counter_field(g.get("norm_ops_hist_json", pd.Series(dtype=str)))
-        rows.append({
-            "case_class": case,
-            "family": fam,
-            "strategy": strat,
-            "norm_tool": tool,
-            "norm_mode": mode,
-            "variants": int(len(g)),
-            "circuits": int(g["circuit_id"].nunique()),
-            "mean_Lstar": float(g["Lstar"].mean()) if "Lstar" in g else None,
-            "median_Lstar": float(g["Lstar"].median()) if "Lstar" in g else None,
-            "mean_t_count": float(g["t_count"].mean()) if "t_count" in g else None,
-            "mean_sat_clauses": float(g["sat_clauses"].mean()) if "sat_clauses" in g else None,
-            "mean_graph_edges": float(g["g_edges"].mean()) if "g_edges" in g else None,
-            "mean_phase_edges": float(g["phase_interaction_edges"].mean()) if "phase_interaction_edges" in g else None,
-            "mean_norm_ops_count": float(g.get("norm_ops_count", pd.Series([0]*len(g))).fillna(0).mean()),
-            "norm_ops_hist_total_json": json.dumps(dict(sorted(op_counts.items())), sort_keys=True),
-            "mean_norm_spider_delta": float(g.get("norm_spider_delta", pd.Series(dtype=float)).dropna().mean()) if "norm_spider_delta" in g and not g["norm_spider_delta"].dropna().empty else None,
-            "mean_norm_edge_delta": float(g.get("norm_edge_delta", pd.Series(dtype=float)).dropna().mean()) if "norm_edge_delta" in g and not g["norm_edge_delta"].dropna().empty else None,
-        })
-    return pd.DataFrame(rows).sort_values(["case_class", "family", "strategy"])
-
-
-def strategy_pair_sensitivity_matrix(df: pd.DataFrame) -> pd.DataFrame:
-    """Pairwise strategy comparison table: how often do two strategies disagree on L*?
-
-    This helps show that the phenomenon is not an artifact of one single strategy:
-    e.g. qiskit_opt2 vs pyzx_clifford_simp disagreement across QAOA path/star/ring.
-    """
-    if df.empty:
-        return pd.DataFrame()
-    d = df[(df.get("analysis_success", False) == True) & (df.get("equiv_status", "") == "pass") & (~df.get("Lstar", pd.Series(dtype=float)).isna())].copy()
-    if d.empty:
-        return pd.DataFrame()
-    rows=[]
-    for cid, g in d.groupby("circuit_id"):
+        strategies = sorted(g["strategy"].astype(str).unique())
         fam = g["family"].iloc[0]
-        vals = {str(r["strategy"]): int(r["Lstar"]) for _, r in g.iterrows()}
-        for a, b in itertools.combinations(sorted(vals), 2):
+
+        def matched_chi_sensitive(gg: pd.DataFrame) -> bool:
+            for _, gt in gg.groupby("ct_t_count"):
+                if gt["chi"].nunique() > 1:
+                    return True
+            return False
+
+        baseline = matched_chi_sensitive(g)
+
+        for drop in strategies:
+            gg = g[g["strategy"].astype(str) != drop]
             rows.append({
-                "circuit_id": cid,
-                "family": fam,
-                "strategy_a": a,
-                "strategy_b": b,
-                "Lstar_a": vals[a],
-                "Lstar_b": vals[b],
-                "delta_abs": abs(vals[a]-vals[b]),
-                "disagree": int(vals[a] != vals[b]),
+                "circuit_id":cid,
+                "family":fam,
+                "baseline_T_matched_chromatic_sensitive":bool(baseline),
+                "dropped_strategy":drop,
+                "remaining_strategies":int(gg["strategy"].nunique()),
+                "sensitivity_after_drop":bool(matched_chi_sensitive(gg)),
             })
-    if not rows:
+
+    return pd.DataFrame(rows)
+
+
+def performance_summary(variant_df: pd.DataFrame) -> pd.DataFrame:
+    valid = variant_df[
+        (variant_df["analysis_success"] == True) &
+        (variant_df["equiv_status"] == "pass")
+    ].copy()
+    if valid.empty:
         return pd.DataFrame()
-    r = pd.DataFrame(rows)
-    out = r.groupby(["family", "strategy_a", "strategy_b"]).agg(
-        circuits=("circuit_id", "nunique"),
-        disagreements=("disagree", "sum"),
-        disagreement_rate=("disagree", "mean"),
-        max_delta_abs=("delta_abs", "max"),
-        mean_delta_abs=("delta_abs", "mean"),
-    ).reset_index()
-    return out.sort_values(["disagreement_rate", "max_delta_abs", "circuits"], ascending=[False, False, False])
 
+    metrics = [
+        "normalization_runtime_s",
+        "equivalence_runtime_s",
+        "ct_rebase_runtime_s",
+        "pauli_event_extraction_runtime_s",
+        "graph_construction_runtime_s",
+        "exact_coloring_runtime_s",
+        "backtracking_coloring_runtime_s",
+        "sat_total_runtime_s",
+        "deep_validation_runtime_s",
+        "branch_analysis_runtime_s",
+        "sat_calls",
+        "sat_chi_variables",
+        "sat_chi_clauses",
+        "graph_nodes",
+        "graph_edges",
+        "ct_t_count",
+    ]
 
-def phase_mechanism_summary(df: pd.DataFrame, circuit_summary: pd.DataFrame) -> pd.DataFrame:
-    """Compare phase/dependency proxy means across stability classes.
-
-    This table is meant for the discussion section: it gives a mechanistic clue
-    about whether sensitivity correlates with phase fragmentation, controlled-edge
-    fractions, CNOT neighborhoods, or graph spectral changes.
-    """
-    if df.empty or circuit_summary is None or circuit_summary.empty:
-        return pd.DataFrame()
-    cs = circuit_summary[["circuit_id", "case_class"]].drop_duplicates()
-    d = df.merge(cs, on="circuit_id", how="left")
-    d = d[(d.get("analysis_success", False) == True) & (d.get("equiv_status", "") == "pass")].copy()
-    if d.empty:
-        return pd.DataFrame()
-    metric_cols = [c for c in [
-        "t_count", "naive_tdepth", "Lstar", "sat_vars", "sat_clauses", "sat_clause_var_ratio",
-        "sat_conflicts", "sat_decisions", "sat_propagations", "g_edges", "g_density",
-        "g_treewidth_minfill", "g_clustering", "g_degree_assortativity", "adj_spectral_radius",
-        "lap_lambda2", "spectrum_entropy", "phase_proxy_tlike_nodes", "phase_proxy_active_wires",
-        "phase_proxy_max_per_wire", "phase_proxy_var_per_wire", "phase_proxy_cnot_neighborhood_hits",
-        "phase_proxy_h_neighborhood_hits", "phase_interaction_edges", "phase_interaction_density",
-        "phase_interaction_treewidth", "dep_edges_target_line", "dep_edges_same_wire_noncommuting",
-        "dep_edges_controlled_fraction"
-    ] if c in d.columns]
-    rows=[]
-    for keys, g in d.groupby(["case_class", "family"], dropna=False):
-        case, fam = keys
-        row = {"case_class": case, "family": fam, "variants": int(len(g)), "circuits": int(g["circuit_id"].nunique())}
-        for c in metric_cols:
-            try:
-                row[f"mean_{c}"] = float(pd.to_numeric(g[c], errors="coerce").mean())
-                row[f"median_{c}"] = float(pd.to_numeric(g[c], errors="coerce").median())
-            except Exception:
-                pass
-        rows.append(row)
-    return pd.DataFrame(rows).sort_values(["case_class", "family"])
-
-
-def minimal_counterexample_candidates(df: pd.DataFrame, counterexamples: pd.DataFrame) -> pd.DataFrame:
-    """Rank counterexamples by simplicity and evidence quality.
-
-    This is not a full gate-deletion reducer. It ranks candidate witnesses already present in the run:
-    it identifies the smallest equivalence-pass witnesses already present in the
-    benchmark run, prioritizing low qubit count, low operation count, low T-count,
-    and high delta in L*/SAT clauses. These are the circuits to inspect manually
-    and later reduce symbolically.
-    """
-    if counterexamples is None or counterexamples.empty or df.empty:
-        return pd.DataFrame()
-    d = df[(df.get("analysis_success", False) == True) & (df.get("equiv_status", "") == "pass")].copy()
-    rows=[]
-    for _, ce in counterexamples.iterrows():
-        cid = ce.get("circuit_id")
-        g = d[d["circuit_id"] == cid]
-        if g.empty: continue
-        rows.append({
-            "circuit_id": cid,
-            "family": ce.get("family"),
-            "n": int(ce.get("n", g["n"].iloc[0]) or 0),
-            "delta_Lstar": ce.get("delta_Lstar"),
-            "low_strategy": ce.get("low_strategy"),
-            "high_strategy": ce.get("high_strategy"),
-            "min_ops": int(pd.to_numeric(g.get("variant_ops"), errors="coerce").min()),
-            "max_ops": int(pd.to_numeric(g.get("variant_ops"), errors="coerce").max()),
-            "min_t_count": int(pd.to_numeric(g.get("t_count"), errors="coerce").min()),
-            "max_t_count": int(pd.to_numeric(g.get("t_count"), errors="coerce").max()),
-            "min_sat_clauses": int(pd.to_numeric(g.get("sat_clauses"), errors="coerce").min()),
-            "max_sat_clauses": int(pd.to_numeric(g.get("sat_clauses"), errors="coerce").max()),
-            "valid_variants": int(len(g)),
-            "distinct_graph_hashes": int(g.get("g_hash", pd.Series(dtype=str)).nunique()),
-        })
-    if not rows:
-        return pd.DataFrame()
-    out = pd.DataFrame(rows)
-    out["simplicity_score"] = (
-        out["n"].fillna(9999)*1000000 + out["min_ops"].fillna(9999)*1000 + out["min_t_count"].fillna(9999)
-        - out["delta_Lstar"].fillna(0)*100
-    )
-    return out.sort_values(["simplicity_score", "delta_Lstar"], ascending=[True, False])
-
-
-
-# ---------------------------------------------------------------------------
-# V7 mechanistic explanation layer
-# ---------------------------------------------------------------------------
-
-def _json_counter(val: Any) -> Counter:
-    """Parse JSON histogram fields safely into a Counter."""
-    if val is None or (isinstance(val, float) and np.isnan(val)):
-        return Counter()
-    if isinstance(val, dict):
-        return Counter(val)
-    try:
-        obj = json.loads(str(val))
-        if isinstance(obj, dict):
-            return Counter({str(k): int(v) if isinstance(v, (int, float, np.integer, np.floating)) and np.isfinite(v) else 1 for k, v in obj.items()})
-    except Exception:
-        pass
-    return Counter()
-
-
-def _counter_to_json(c: Counter) -> str:
-    return json.dumps({str(k): int(v) for k, v in sorted(c.items(), key=lambda kv: str(kv[0]))}, sort_keys=True)
-
-
-def typed_dependency_summary(df: pd.DataFrame, circuit_summary: pd.DataFrame) -> pd.DataFrame:
-    """Aggregate edge/blocker provenance by stability class and family.
-
-    Per-variant edge blocker/reason histograms are converted here into a
-    table turns those JSON blobs into a typed-dependency summary that can be
-    used directly in the mechanism section of a paper.
-    """
-    if df is None or df.empty or circuit_summary is None or circuit_summary.empty:
-        return pd.DataFrame()
-    cs = circuit_summary[["circuit_id", "case_class"]].drop_duplicates()
-    d = df.merge(cs, on="circuit_id", how="left")
-    d = d[(d.get("analysis_success", False) == True) & (d.get("equiv_status", "") == "pass")].copy()
-    if d.empty:
-        return pd.DataFrame()
-    rows=[]
-    for (case, fam), g in d.groupby(["case_class", "family"], dropna=False):
-        blocker = Counter(); reason = Counter(); shared = Counter()
-        for _, r in g.iterrows():
-            blocker.update(_json_counter(r.get("edge_blocker_hist_json")))
-            blocker.update(_json_counter(r.get("dep_blocker_hist_json_v4")))
-            reason.update(_json_counter(r.get("edge_reason_hist_json")))
-            reason.update(_json_counter(r.get("dep_reason_hist_json_v4")))
-            shared.update(_json_counter(r.get("dep_shared_wire_hist_json")))
-        total_edges = int(sum(blocker.values())) if blocker else int(pd.to_numeric(g.get("g_edges"), errors="coerce").fillna(0).sum())
-        top_blocker = blocker.most_common(1)[0] if blocker else ("none", 0)
-        top_reason = reason.most_common(1)[0] if reason else ("none", 0)
-        rows.append({
-            "case_class": case,
-            "family": fam,
-            "variants": int(len(g)),
-            "circuits": int(g["circuit_id"].nunique()),
-            "typed_edges_total": int(total_edges),
-            "top_blocker": str(top_blocker[0]),
-            "top_blocker_count": int(top_blocker[1]),
-            "top_reason": str(top_reason[0]),
-            "top_reason_count": int(top_reason[1]),
-            "blocker_hist_json": _counter_to_json(blocker),
-            "reason_hist_json": _counter_to_json(reason),
-            "shared_wire_hist_json": _counter_to_json(shared),
-            "mean_dep_controlled_fraction": float(pd.to_numeric(g.get("dep_edges_controlled_fraction"), errors="coerce").mean()) if "dep_edges_controlled_fraction" in g else None,
-            "mean_target_line_edges": float(pd.to_numeric(g.get("dep_edges_target_line"), errors="coerce").mean()) if "dep_edges_target_line" in g else None,
-            "mean_same_wire_noncommuting_edges": float(pd.to_numeric(g.get("dep_edges_same_wire_noncommuting"), errors="coerce").mean()) if "dep_edges_same_wire_noncommuting" in g else None,
-        })
-    return pd.DataFrame(rows).sort_values(["case_class", "family"])
-
-
-def spectral_stability_summary(df: pd.DataFrame, circuit_summary: pd.DataFrame) -> pd.DataFrame:
-    """Quantify whether sensitive circuits occupy distinct spectral regimes."""
-    if df is None or df.empty or circuit_summary is None or circuit_summary.empty:
-        return pd.DataFrame()
-    cs = circuit_summary[["circuit_id", "case_class"]].drop_duplicates()
-    d = df.merge(cs, on="circuit_id", how="left")
-    d = d[(d.get("analysis_success", False) == True) & (d.get("equiv_status", "") == "pass")].copy()
-    if d.empty:
-        return pd.DataFrame()
-    metrics = [c for c in [
-        "adj_spectral_radius", "lap_lambda2", "lap_spectral_radius", "spectrum_entropy",
-        "g_density", "g_treewidth_minfill", "g_clustering_avg", "g_assortativity",
-        "phase_interaction_density", "phase_interaction_treewidth"
-    ] if c in d.columns]
-    rows=[]
-    for (case, fam), g in d.groupby(["case_class", "family"], dropna=False):
-        row={"case_class":case, "family":fam, "variants":int(len(g)), "circuits":int(g["circuit_id"].nunique())}
-        for c in metrics:
-            vals = pd.to_numeric(g[c], errors="coerce").dropna()
-            if vals.empty:
-                row[f"mean_{c}"] = None; row[f"std_{c}"] = None; row[f"min_{c}"] = None; row[f"max_{c}"] = None
-            else:
-                row[f"mean_{c}"] = float(vals.mean())
-                row[f"std_{c}"] = float(vals.std(ddof=0))
-                row[f"min_{c}"] = float(vals.min())
-                row[f"max_{c}"] = float(vals.max())
-        rows.append(row)
-    return pd.DataFrame(rows).sort_values(["case_class", "family"])
-
-
-def rewrite_causality_matrix(df: pd.DataFrame, circuit_summary: pd.DataFrame) -> pd.DataFrame:
-    """Strategy/op-level causal proxy for L* changes.
-
-    PyZX does not expose a fully verified primitive rewrite trace in all versions,
-    so this is not a formal causality proof.  It is a controlled provenance proxy:
-    for each L*-sensitive circuit we compare low-L* and high-L* variants and
-    aggregate which tools/modes/recorded ops appear on the high side.
-    """
-    if df is None or df.empty or circuit_summary is None or circuit_summary.empty:
-        return pd.DataFrame()
-    sens_ids = set(circuit_summary.loc[circuit_summary["case_class"] == "Lstar_sensitive", "circuit_id"].astype(str))
-    d = df[(df.get("analysis_success", False) == True) & (df.get("equiv_status", "") == "pass") & (df["circuit_id"].astype(str).isin(sens_ids))].copy()
-    if d.empty:
-        return pd.DataFrame()
-    rows=[]
-    for cid, g in d.groupby("circuit_id"):
-        try:
-            g = g.dropna(subset=["Lstar"])
-            if g.empty or g["Lstar"].nunique() <= 1: continue
-            low = g.sort_values(["Lstar", "sat_clauses", "t_count"], ascending=[True, True, True]).iloc[0]
-            high = g.sort_values(["Lstar", "sat_clauses", "t_count"], ascending=[False, False, False]).iloc[0]
-            low_ops = _json_counter(low.get("norm_ops_hist_json"))
-            high_ops = _json_counter(high.get("norm_ops_hist_json"))
-            all_ops = sorted(set(low_ops) | set(high_ops))
-            op_delta = {op: int(high_ops.get(op, 0) - low_ops.get(op, 0)) for op in all_ops}
-            rows.append({
-                "circuit_id": cid,
-                "family": high.get("family"),
-                "n": high.get("n"),
-                "low_strategy": low.get("strategy"),
-                "high_strategy": high.get("strategy"),
-                "low_tool": low.get("norm_tool"),
-                "high_tool": high.get("norm_tool"),
-                "low_mode": low.get("norm_mode"),
-                "high_mode": high.get("norm_mode"),
-                "delta_Lstar": float(high.get("Lstar", 0)) - float(low.get("Lstar", 0)),
-                "delta_t_count": float(high.get("t_count", 0)) - float(low.get("t_count", 0)),
-                "delta_graph_edges": float(high.get("g_edges", high.get("g_m", 0)) or 0) - float(low.get("g_edges", low.get("g_m", 0)) or 0),
-                "delta_sat_clauses": float(high.get("sat_clauses", 0) or 0) - float(low.get("sat_clauses", 0) or 0),
-                "delta_phase_edges": float(high.get("phase_interaction_edges", 0) or 0) - float(low.get("phase_interaction_edges", 0) or 0),
-                "delta_dep_controlled_fraction": float(high.get("dep_edges_controlled_fraction", 0) or 0) - float(low.get("dep_edges_controlled_fraction", 0) or 0),
-                "low_ops_hist_json": _counter_to_json(low_ops),
-                "high_ops_hist_json": _counter_to_json(high_ops),
-                "ops_delta_json": json.dumps(op_delta, sort_keys=True),
-            })
-        except Exception:
+    rows = []
+    for metric in metrics:
+        if metric not in valid.columns:
             continue
-    if not rows:
-        return pd.DataFrame()
-    pair = pd.DataFrame(rows)
-    # Add an aggregate table shape by duplicating aggregate rows with circuit_id="__aggregate__".
-    agg_rows=[]
-    for (fam, low_tool, high_tool, high_mode), g in pair.groupby(["family", "low_tool", "high_tool", "high_mode"], dropna=False):
-        op_tot = Counter()
-        for v in g["ops_delta_json"]:
-            op_tot.update(_json_counter(v))
-        agg_rows.append({
-            "circuit_id":"__aggregate__", "family":fam, "n":None,
-            "low_strategy":"*", "high_strategy":"*", "low_tool":low_tool, "high_tool":high_tool,
-            "low_mode":"*", "high_mode":high_mode,
-            "delta_Lstar":float(g["delta_Lstar"].mean()),
-            "delta_t_count":float(g["delta_t_count"].mean()),
-            "delta_graph_edges":float(g["delta_graph_edges"].mean()),
-            "delta_sat_clauses":float(g["delta_sat_clauses"].mean()),
-            "delta_phase_edges":float(g["delta_phase_edges"].mean()),
-            "delta_dep_controlled_fraction":float(g["delta_dep_controlled_fraction"].mean()),
-            "low_ops_hist_json":"{}", "high_ops_hist_json":"{}", "ops_delta_json":_counter_to_json(op_tot),
-            "circuits": int(g["circuit_id"].nunique())
-        })
-    return pd.concat([pair, pd.DataFrame(agg_rows)], ignore_index=True).sort_values(["family", "circuit_id", "delta_Lstar"], ascending=[True, True, False])
-
-
-def minimal_witness_reduction_plan(df: pd.DataFrame, candidates: pd.DataFrame) -> pd.DataFrame:
-    """Create a deterministic reduction plan for the best minimal witnesses.
-
-    The script does not perform semantics-changing gate deletion automatically,
-    because that could silently create invalid witnesses.  Instead it ranks the
-    smallest equivalence-pass witnesses and specifies a safe manual/symbolic
-    reduction plan: preserve the two strategies, preserve equivalence, preserve
-    Var(L*)>0, then greedily try removing Clifford-only regions and repeated
-    commuting phase blocks.
-    """
-    if candidates is None or candidates.empty:
-        return pd.DataFrame()
-    rows=[]
-    for _, r in candidates.head(30).iterrows():
-        cid = str(r.get("circuit_id"))
-        g = df[(df.get("circuit_id", "").astype(str) == cid) & (df.get("analysis_success", False) == True) & (df.get("equiv_status", "") == "pass")].copy() if df is not None and not df.empty else pd.DataFrame()
-        strategies = sorted(g["strategy"].astype(str).unique()) if not g.empty and "strategy" in g else []
+        x = pd.to_numeric(valid[metric], errors="coerce").dropna()
+        if x.empty:
+            continue
         rows.append({
-            "circuit_id": cid,
-            "family": r.get("family"),
-            "n": r.get("n"),
-            "delta_Lstar": r.get("delta_Lstar"),
-            "low_strategy": r.get("low_strategy"),
-            "high_strategy": r.get("high_strategy"),
-            "available_strategies_json": json.dumps(strategies),
-            "priority": "highest" if len(rows) < 5 else "normal",
-            "reduction_objective": "minimize gates while preserving equivalence-pass and Var(L*)>0",
-            "safe_reduction_steps": "1 remove terminal Clifford pairs; 2 remove repeated identical phase blocks; 3 reduce repeated QAOA layers; 4 re-run only low/high strategies; 5 verify by QCEC/statevector; 6 freeze minimal QASM witness",
+            "metric":metric,
+            "count":int(len(x)),
+            "min":float(x.min()),
+            "median":float(x.median()),
+            "mean":float(x.mean()),
+            "p95":float(x.quantile(0.95)),
+            "max":float(x.max()),
         })
     return pd.DataFrame(rows)
 
 
-def paper_claim_readiness_report(df: pd.DataFrame, circuit_summary: pd.DataFrame, strategy_health: pd.DataFrame) -> pd.DataFrame:
-    """Small checklist table for deciding whether a run is final-run."""
-    rows=[]
-    valid = df[(df.get("analysis_success", False) == True) & (df.get("equiv_status", "") == "pass")].copy() if df is not None and not df.empty else pd.DataFrame()
-    total_circuits = int(circuit_summary["circuit_id"].nunique()) if circuit_summary is not None and not circuit_summary.empty else 0
-    sens = int((circuit_summary["case_class"] == "Lstar_sensitive").sum()) if circuit_summary is not None and not circuit_summary.empty else 0
-    stable = int((circuit_summary["case_class"] == "graph_and_Lstar_stable").sum()) if circuit_summary is not None and not circuit_summary.empty else 0
-    graph_only = int((circuit_summary["case_class"] == "graph_varies_Lstar_stable").sum()) if circuit_summary is not None and not circuit_summary.empty else 0
-    rows.append({"criterion":"equivalence_pass_variants", "value":int(len(valid)), "target":">= 500 for final large run", "status":"pass" if len(valid)>=500 else "partial"})
-    rows.append({"criterion":"summarized_circuits", "value":total_circuits, "target":">= 100 for final paper run", "status":"pass" if total_circuits>=100 else "partial"})
-    rows.append({"criterion":"Lstar_sensitive_circuits", "value":sens, "target":">= 5 plus minimal witness", "status":"pass" if sens>=5 else "partial"})
-    rows.append({"criterion":"negative_controls_stable", "value":stable, "target":">= 5", "status":"pass" if stable>=5 else "partial"})
-    rows.append({"criterion":"graph_sensitive_SAT_stable", "value":graph_only, "target":">= 3", "status":"pass" if graph_only>=3 else "partial"})
-    if strategy_health is not None and not strategy_health.empty:
-        try:
-            min_success = float(pd.to_numeric(strategy_health.get("analysis_success_rate"), errors="coerce").dropna().min())
-        except Exception:
-            min_success = 0.0
-        rows.append({"criterion":"strategy_health_min_success_rate", "value":min_success, "target":">= 0.5 or explicitly optional", "status":"pass" if min_success>=0.5 else "inspect"})
-    fams = int(valid["family"].nunique()) if not valid.empty and "family" in valid else 0
-    rows.append({"criterion":"families_covered", "value":fams, "target":">= 10", "status":"pass" if fams>=10 else "partial"})
-    return pd.DataFrame(rows)
-
-
-def family_stability_taxonomy(circuit_summary: pd.DataFrame) -> pd.DataFrame:
-    """Condense circuit-level classes into a inspection family taxonomy."""
-    if circuit_summary is None or circuit_summary.empty:
-        return pd.DataFrame()
-    rows=[]
-    for fam, g in circuit_summary.groupby("family"):
-        total = len(g)
-        sens = int((g["case_class"] == "Lstar_sensitive").sum())
-        gvar = int((g["case_class"] == "graph_varies_Lstar_stable").sum())
-        stable = int((g["case_class"] == "graph_and_Lstar_stable").sum())
-        if total == 0:
-            label = "empty"
-        elif sens / total >= 0.5:
-            label = "SAT-sensitive family"
-        elif gvar / total >= 0.5:
-            label = "graph-sensitive SAT-stable family"
-        elif stable / total >= 0.5:
-            label = "normalization-stable family"
-        else:
-            label = "mixed/transition family"
-        rows.append({
-            "family": fam, "circuits": int(total), "Lstar_sensitive": sens,
-            "graph_varies_Lstar_stable": gvar, "graph_and_Lstar_stable": stable,
-            "sensitivity_rate": float(sens/total) if total else 0.0,
-            "graph_variation_rate": float((sens+gvar)/total) if total else 0.0,
-            "taxonomy_label": label,
-        })
-    return pd.DataFrame(rows).sort_values(["sensitivity_rate", "graph_variation_rate", "family"], ascending=[False, False, True])
-
-
-def sat_hardness_summary(df: pd.DataFrame) -> pd.DataFrame:
-    """Summarize SAT hardness metrics by family/strategy/size class."""
-    if df.empty:
-        return pd.DataFrame()
-    d = df[(df.get("analysis_success", False) == True) & (df.get("equiv_status", "") == "pass")].copy()
-    if d.empty: return pd.DataFrame()
-    if "size_class" not in d.columns:
-        d["size_class"] = "unknown"
-    cols = [c for c in ["sat_vars", "sat_clauses", "sat_clause_var_ratio", "sat_time_s", "sat_conflicts", "sat_decisions", "sat_propagations", "sat_decision_per_var", "sat_propagation_per_clause"] if c in d.columns]
-    agg = d.groupby(["family", "size_class", "strategy"]).agg(
-        variants=("strategy", "count"), circuits=("circuit_id", "nunique"),
-        median_Lstar=("Lstar", "median"), max_Lstar=("Lstar", "max"),
-        median_t_count=("t_count", "median"), max_t_count=("t_count", "max"),
-    ).reset_index()
-    for c in cols:
-        tmp = d.groupby(["family", "size_class", "strategy"])[c].agg(["median", "max", "mean"]).reset_index()
-        tmp = tmp.rename(columns={"median":f"median_{c}", "max":f"max_{c}", "mean":f"mean_{c}"})
-        agg = agg.merge(tmp, on=["family", "size_class", "strategy"], how="left")
-    return agg.sort_values(["family", "size_class", "median_sat_clauses" if "median_sat_clauses" in agg.columns else "variants"], ascending=[True, True, False])
-
-
-def scaling_summary(df: pd.DataFrame) -> pd.DataFrame:
-    """Paper-grade scaling summary by family and size class."""
-    if df.empty or "analysis_success" not in df.columns:
-        return pd.DataFrame([])
-    d = df[(df["analysis_success"] == True) & (df["equiv_status"].isin(["pass", "unknown"]))].copy()
-    if d.empty: return pd.DataFrame([])
-    if "size_class" not in d.columns:
-        d["size_class"] = d.apply(lambda r: size_class_from_counts(int(r.get("variant_qubits", r.get("n",0)) or 0), int(r.get("t_count",0) or 0), int(r.get("variant_ops",0) or 0)), axis=1)
-    agg = d.groupby(["family", "size_class"]).agg(
-        variants=("strategy", "count"),
-        circuits=("circuit_id", "nunique"),
-        median_qubits=("variant_qubits", "median"),
-        max_qubits=("variant_qubits", "max"),
-        median_ops=("variant_ops", "median"),
-        max_ops=("variant_ops", "max"),
-        median_t_count=("t_count", "median"),
-        max_t_count=("t_count", "max"),
-        median_Lstar=("Lstar", "median"),
-        max_Lstar=("Lstar", "max"),
-        median_sat_vars=("sat_vars", "median"),
-        max_sat_vars=("sat_vars", "max"),
-        median_sat_clauses=("sat_clauses", "median"),
-        max_sat_clauses=("sat_clauses", "max"),
-        median_sat_time=("sat_time_s", "median"),
-        max_sat_time=("sat_time_s", "max"),
-        median_treewidth=("g_treewidth_minfill", "median"),
-        max_treewidth=("g_treewidth_minfill", "max"),
-    ).reset_index()
-    return agg.sort_values(["family", "size_class"])
-
-
-def external_benchmark_summary(df: pd.DataFrame) -> pd.DataFrame:
-    """Summarize imported QASM/MQT/SupermarQ subsets separately."""
-    if df.empty: return pd.DataFrame([])
-    d = df[df["family"].isin(["external_qasm", "mqtbench", "supermarq"])].copy()
-    if d.empty: return pd.DataFrame([])
-    return d.groupby(["family"]).agg(
-        variants=("strategy", "count"),
-        circuits=("circuit_id", "nunique"),
-        pass_equiv=("equiv_status", lambda s: int((s=="pass").sum())),
-        unknown_equiv=("equiv_status", lambda s: int((s=="unknown").sum())),
-        failed_equiv=("equiv_status", lambda s: int((s=="fail").sum())),
-        median_qubits=("variant_qubits", "median"),
-        max_qubits=("variant_qubits", "max"),
-        median_ops=("variant_ops", "median"),
-        max_ops=("variant_ops", "max"),
-        median_Lstar=("Lstar", "median"),
-        max_Lstar=("Lstar", "max"),
-    ).reset_index()
-
-def write_latex_tables(outdir: Path, df_variants: pd.DataFrame, circuit_summary: pd.DataFrame, family_summary: pd.DataFrame, counterexamples: pd.DataFrame) -> None:
-    texdir = outdir / "latex"
-    ensure_dir(texdir)
-    try:
-        if not family_summary.empty:
-            cols = ["family", "circuits", "Lstar_sensitive", "graph_varies_Lstar_stable", "graph_and_Lstar_stable", "sensitivity_rate", "max_var_Lstar"]
-            text_write(texdir / "family_summary.tex", family_summary[cols].to_latex(index=False, escape=True, float_format="%.3f"))
-        if not counterexamples.empty:
-            cols = ["circuit_id", "family", "n", "low_strategy", "low_Lstar", "high_strategy", "high_Lstar", "delta_Lstar", "delta_t_count"]
-            text_write(texdir / "counterexamples.tex", counterexamples[cols].head(20).to_latex(index=False, escape=True))
-        if not circuit_summary.empty:
-            cols = ["circuit_id", "family", "n", "case_class", "valid_variants", "min_Lstar", "max_Lstar", "var_Lstar", "distinct_graph_hashes", "var_sat_clauses"]
-            text_write(texdir / "circuit_summary.tex", circuit_summary[cols].head(60).to_latex(index=False, escape=True))
-    except Exception as e:
-        text_write(texdir / "latex_error.txt", repr(e))
-
-
-def plot_outputs(outdir: Path, df: pd.DataFrame, circuit_summary: pd.DataFrame, family_summary: pd.DataFrame) -> None:
-    if not HAVE_MPL:
-        return
-    pdir = outdir / "plots"
-    ensure_dir(pdir)
-    try:
-        if not family_summary.empty:
-            fig = plt.figure(figsize=(9, 4.8))
-            x = np.arange(len(family_summary))
-            plt.bar(x, family_summary["sensitivity_rate"].astype(float))
-            plt.xticks(x, family_summary["family"].astype(str), rotation=45, ha="right")
-            plt.ylabel("L* sensitivity rate")
-            plt.title("Normalization sensitivity by circuit family")
-            plt.tight_layout(); fig.savefig(pdir / "family_sensitivity_rate.pdf"); fig.savefig(pdir / "family_sensitivity_rate.png", dpi=180); plt.close(fig)
-        valid = df[(df["analysis_success"] == True) & (df["equiv_status"] == "pass")].copy()
-        if not valid.empty:
-            fig = plt.figure(figsize=(6, 4))
-            plt.scatter(valid["g_treewidth_minfill"], valid["sat_clauses"], s=18, alpha=0.7)
-            plt.xlabel("Dependency graph treewidth (min-fill)")
-            plt.ylabel("SAT clauses")
-            plt.yscale("log")
-            plt.title("SAT encoding size vs graph treewidth")
-            plt.tight_layout(); fig.savefig(pdir / "treewidth_vs_sat_clauses.pdf"); fig.savefig(pdir / "treewidth_vs_sat_clauses.png", dpi=180); plt.close(fig)
-            fig = plt.figure(figsize=(6, 4))
-            plt.scatter(valid["t_count"], valid["Lstar"], s=18, alpha=0.7)
-            plt.xlabel("T-count")
-            plt.ylabel("SAT-certified L*")
-            plt.title("T-count vs SAT-certified T-layering")
-            plt.tight_layout(); fig.savefig(pdir / "tcount_vs_lstar.pdf"); fig.savefig(pdir / "tcount_vs_lstar.png", dpi=180); plt.close(fig)
-        if not circuit_summary.empty:
-            fig = plt.figure(figsize=(6, 4))
-            plt.scatter(circuit_summary["distinct_graph_hashes"], circuit_summary["var_Lstar"], s=20, alpha=0.75)
-            plt.xlabel("Distinct dependency graph hashes")
-            plt.ylabel("Var(L*)")
-            plt.title("Graph variability vs SAT-layer variability")
-            plt.tight_layout(); fig.savefig(pdir / "graph_variability_vs_lstar_variability.pdf"); fig.savefig(pdir / "graph_variability_vs_lstar_variability.png", dpi=180); plt.close(fig)
-    except Exception as e:
-        text_write(pdir / "plot_error.txt", traceback.format_exc())
-
-# ---------------------------------------------------------------------------
-# External QASM loading
-# ---------------------------------------------------------------------------
-
-
-def load_qasm_specs(qasm_dir: Optional[str], limit: Optional[int] = None, recursive: bool = False,
-                    max_qubits: int = 64, max_ops: int = 200000) -> List[BenchmarkSpec]:
-    """Load external QASM benchmarks. Supports recursive QASM library layouts.
-
-    This is intentionally conservative: huge files are skipped by max_qubits/max_ops
-    so large external suites can be pointed at without crashing the run.
-    """
-    if not qasm_dir:
-        return []
-    specs: List[BenchmarkSpec] = []
-    root = Path(qasm_dir)
-    patterns = ["*.qasm", "*.qasm2"]  # V7.1: .qasm3 intentionally skipped
-    paths: List[Path] = []
-    for pat in patterns:
-        paths.extend(root.rglob(pat) if recursive else root.glob(pat))
-    paths = sorted(set(paths))
-    # Report skipped QASM3 files explicitly so the run log is transparent.
-    try:
-        qasm3_paths = sorted(root.rglob("*.qasm3") if recursive else root.glob("*.qasm3"))
-        if qasm3_paths:
-            print(f"[qasm-load] skipped {len(qasm3_paths)} .qasm3 files by strict-QASM2 policy")
-    except Exception:
-        pass
-    if limit:
-        paths = paths[:limit]
-    for pth in paths:
-        try:
-            txt = pth.read_text(encoding="utf-8", errors="ignore")
-            qc = circuit_from_qasm(txt)
-            if qc.num_qubits > max_qubits or len(qc.data) > max_ops:
-                print(f"[qasm-load] skipped too large {pth} q={qc.num_qubits} ops={len(qc.data)}")
-                continue
-            rel = safe_name(str(pth.relative_to(root)).replace(os.sep, "__"))
-            specs.append(BenchmarkSpec("external_qasm", rel, qc.num_qubits, len(qc.data), 0, qc))
-        except Exception as e:
-            print(f"[qasm-load] failed {pth}: {e}")
-    return specs
-
-
-def load_mqtbench_specs(enabled: bool, mode: str, max_qubits: int = 32, max_ops: int = 200000) -> List[BenchmarkSpec]:
-    """Best-effort MQTBench integration.
-
-    The mqt.bench API has changed across releases; this function tries a few
-    common call styles and silently returns an empty list if unavailable. This
-    keeps the script portable while allowing SOTA benchmark inclusion when the
-    package is installed.
-    """
-    if not enabled:
-        return []
-    specs: List[BenchmarkSpec] = []
-    try:
-        import mqt.bench as mqtbench  # type: ignore
-    except Exception as e:
-        print(f"[mqtbench] unavailable: {e}")
-        return specs
-    algos = ["ghz", "graphstate", "qft", "qftentangled", "dj", "grover-noancilla", "vqe", "qaoa"]
-    qs = [4, 6, 8] if mode == "quick" else [4, 6, 8, 10, 12] if mode == "medium" else [4, 6, 8, 10, 12, 16, 20]
-    for algo in algos:
-        for n in qs:
-            try:
-                qc = None
-                # Common modern API: get_benchmark(benchmark_name, level, circuit_size)
-                for call in [
-                    lambda: mqtbench.get_benchmark(benchmark_name=algo, level="alg", circuit_size=n),
-                    lambda: mqtbench.get_benchmark(algo, "alg", n),
-                    lambda: mqtbench.get_benchmark(algo, n),
-                ]:
-                    try:
-                        qc = call(); break
-                    except Exception:
-                        qc = None
-                if qc is None: continue
-                if hasattr(qc, "decompose"):
-                    try: qc = qc.decompose(reps=10)
-                    except Exception: pass
-                if qc.num_qubits > max_qubits or len(qc.data) > max_ops: continue
-                specs.append(BenchmarkSpec("mqtbench", safe_name(f"mqt_{algo}_n{n}"), qc.num_qubits, n, 0, qc))
-            except Exception:
-                continue
-    print(f"[mqtbench] loaded {len(specs)} circuits")
-    return specs
-
-
-def load_supermarq_specs(enabled: bool, mode: str, max_qubits: int = 32, max_ops: int = 200000) -> List[BenchmarkSpec]:
-    """Best-effort SupermarQ integration when supermarq-benchmarks is installed."""
-    if not enabled:
-        return []
-    specs: List[BenchmarkSpec] = []
-    try:
-        import supermarq  # type: ignore
-        import supermarq.benchmarks as smb  # type: ignore
-    except Exception as e:
-        print(f"[supermarq] unavailable: {e}")
-        return specs
-    qs = [4, 6] if mode == "quick" else [4, 6, 8, 10] if mode == "medium" else [4, 6, 8, 10, 12, 16]
-    constructors = []
-    for name in ["GHZ", "MerminBell", "BitCode", "PhaseCode", "QAOAFermionicSwapProxy", "HamiltonianSimulation", "VQEProxy"]:
-        if hasattr(smb, name): constructors.append((name, getattr(smb, name)))
-    for name, cls in constructors:
-        for n in qs:
-            try:
-                obj = None
-                for args in [(n,), (n, 1), (n, 2)]:
-                    try:
-                        obj = cls(*args); break
-                    except Exception:
-                        obj = None
-                if obj is None: continue
-                qc = None
-                for meth in ["circuit", "qiskit_circuit", "generate_circuit"]:
-                    if hasattr(obj, meth):
-                        try:
-                            qc = getattr(obj, meth)(); break
-                        except Exception:
-                            pass
-                if qc is None and hasattr(obj, "_circuit"):
-                    qc = obj._circuit
-                if qc is None: continue
-                if qc.num_qubits > max_qubits or len(qc.data) > max_ops: continue
-                specs.append(BenchmarkSpec("supermarq", safe_name(f"supermarq_{name}_n{n}"), qc.num_qubits, n, 0, qc))
-            except Exception:
-                continue
-    print(f"[supermarq] loaded {len(specs)} circuits")
-    return specs
-
-# ---------------------------------------------------------------------------
-# Main runner
-# ---------------------------------------------------------------------------
-
-
-def is_known_heavy_case(spec: BenchmarkSpec, strat_name: str, cfg: RunConfig) -> bool:
-    """Guard against backend-heavy branches that dominate runtime but are not
-    needed for the main normalization-sensitivity claim.
-
-    The heavy-case policy is conservative: it keeps the benchmark instance, but
-    skips only known heavy normalization branches (mainly full/random ZX and
-    tket) for families that repeatedly cause workstation-scale hangs. The skipped
-    rows are explicitly marked as ``known_heavy_skipped`` and are never used as
-    negative evidence.
-    """
-    if not getattr(cfg, "skip_known_heavy_cases", True):
-        return False
-
-    fam = str(spec.family).lower()
-    cid = str(spec.circuit_id).lower()
-    st = str(strat_name).lower()
-    heavy_pyzx = any(x in st for x in ["full_reduce", "random_mix", "clifford_simp"])
-    tket_branch = "tket" in st
-    heavy_backend = heavy_pyzx or (tket_branch and getattr(cfg, "skip_tket_on_medium_large_heavy", True))
-
-    try:
-        nval = int(spec.n)
-    except Exception:
-        nval = 0
-    try:
-        ops = len(spec.circuit.data)
-    except Exception:
-        ops = 0
-
-    # QAOA p=2 at n>=12 is a backend stress case; p=1 already gives the
-    # separation witnesses and p=2 up to n<=10 remains in the main run.
-    if fam == "qaoa_ring" and "_p2" in cid and nval > int(getattr(cfg, "max_qaoa_p2_n", 10)):
-        if heavy_backend:
-            return True
-
-    # Random CNOT+T n>=10 repeatedly causes full/random ZX and tket to dominate
-    # runtime. Keep fast strategies; skip only heavy branches.
-    if fam == "random_cnot_t" and nval >= int(getattr(cfg, "random_cnot_t_heavy_n", 10)):
-        if heavy_backend:
-            return True
-
-    # Hardware-efficient ansatz around n>=12 can be slow under tket/full ZX.
-    if fam in ("hardware_efficient_linear", "hardware_efficient_circular", "real_amplitudes") and nval >= int(getattr(cfg, "hea_heavy_n", 12)):
-        if heavy_backend:
-            return True
-
-    # Large decomposed arithmetic/proxy circuits: avoid only the expensive
-    # random/full simplification branches, not the full instance.
-    if fam in ("modular_adder_proxy", "multiplier_proxy") and ops > 800:
-        if heavy_pyzx or tket_branch:
-            return True
-
-    # Generic safety: avoid expensive randomized/full ZX simplification on very
-    # large decomposed circuits unless disabled explicitly.
-    if ops > 2500 and heavy_pyzx:
-        return True
-
-    return False
-
-def run(cfg: RunConfig) -> Dict[str, Any]:
-    outdir = Path(cfg.outdir)
-    if outdir.exists():
-        # never delete by default; create subrun
-        pass
-    ensure_dir(outdir)
-    logp = outdir / "run.log"
-    append_log(logp, f"ZX normalization sensitivity start mode={cfg.mode}")
-    env = {
-        "python": sys.version,
-        "have_qiskit": HAVE_QISKIT,
-        "qiskit_error": globals().get("QISKIT_IMPORT_ERROR", None),
-        "have_pyzx": HAVE_PYZX,
-        "have_pysat": HAVE_PYSAT,
-        "have_qcec": HAVE_QCEC,
-        "have_tket": HAVE_TKET,
-        "tket_import_error": globals().get("TKET_IMPORT_ERROR", None),
-        "tket_available_passes": globals().get("TKET_AVAILABLE_PASSES", []),
-        "tket_selected_pass": (_select_tket_pass()[0] if HAVE_TKET else None),
-        "strict_qasm2_only": True,
-        "have_scipy": HAVE_SCIPY,
-        "have_pynauty": HAVE_PYNAUTY,
-        "config": dataclasses.asdict(cfg),
+def write_model_specification(outdir: Path) -> None:
+    spec = {
+        "object_chain":[
+            "original circuit C",
+            "normalization strategy N_s",
+            "normalized/extracted circuit D_s",
+            "fixed exact Clifford+T rebase R_CT(D_s)",
+            "explicit T/Tdg events tau_i",
+            "suffix-Clifford Pauli signatures P_i",
+            "Pauli anticommutation graph G_AC",
+            "exact chromatic number chi(G_AC)"
+        ],
+        "semantic_equivalence":
+            "projective circuit equivalence; equality up to one global phase",
+        "vertex":
+            "one explicit T or Tdg occurrence after the fixed exact Clifford+T rebase",
+        "pauli_signature":
+            "P_i = C_suffix Z_q C_suffix^dagger in the projective Pauli group; "
+            "implemented by binary symplectic propagation and independently "
+            "cross-checked by direct matrix conjugation on small instances",
+        "edge":
+            "{i,j} is an edge iff P_i and P_j anticommute, equivalently their "
+            "binary symplectic inner product equals 1 mod 2",
+        "chromatic_interpretation":
+            "minimum number of classes partitioning the event set such that "
+            "all Pauli signatures within each class commute pairwise",
+        "explicit_nonclaims":[
+            "chi(G_AC) is not claimed to be physical T-depth",
+            "chi(G_AC) is not claimed to be executable schedule depth",
+            "the graph is pipeline-relative, not an intrinsic unitary invariant",
+            "the finite normalization strategy set is not claimed exhaustive",
+        ],
+        "propositions":[
+            "Pauli symplectic criterion: two Pauli signatures anticommute iff "
+            "their symplectic inner product is 1",
+            "Proper k-colorings of G_AC are in bijection with partitions of the "
+            "event set into k pairwise-commuting classes",
+            "Hence chi(G_AC) equals the minimum number of pairwise-commuting classes",
+            "Global Clifford conjugation preserves the anticommutation graph",
+            "Graph isomorphism implies equal chromatic number",
+            "Observed chromatic diversity cannot exceed observed graph-isomorphism diversity",
+            "Observed graph/chromatic diversity is monotone under enlargement of "
+            "the finite strategy set",
+        ],
+        "controls":[
+            "same-T-count pair analysis",
+            "PyZX-only primary sensitivity analysis",
+            "exact graph-isomorphism classification",
+            "representation-hash deduplication",
+            "direct Pauli-axis matrix validation",
+            "projective Pauli-rotation reconstruction validation",
+            "independent exact coloring and SAT cross-check",
+        ],
     }
-    json_dump(outdir / "environment.json", env)
+    json_dump(outdir / "model_specification.json", spec)
+
+
+def write_reviewer_evidence_manifest(outdir: Path) -> None:
+    manifest = {
+        "Reviewer1_main_notions":{
+            "status":"answered_by_code_outputs",
+            "evidence":[
+                "model_specification.json",
+                "variant_metrics.csv",
+                "instances/*/*/pauli_events.csv",
+                "instances/*/*/edge_witnesses.csv",
+            ]
+        },
+        "Reviewer1_normalization_and_extraction":{
+            "status":"answered_by_code_outputs",
+            "evidence":[
+                "variant_metrics.csv:norm_trace_json",
+                "strategy_health.csv",
+                "representation_diagnostics.csv",
+                "unique_outcome_summary.csv",
+            ]
+        },
+        "Reviewer1_semantic_equivalence":{
+            "status":"answered_by_code_outputs",
+            "evidence":[
+                "variant_metrics.csv:equiv_status,equiv_method",
+                "PRIMARY_WITNESS/witness_summary.json",
+            ]
+        },
+        "Reviewer1_full_example":{
+            "status":"answered_by_primary_witness_bundle",
+            "evidence":["PRIMARY_WITNESS/"]
+        },
+        "Reviewer1_strategy_representativeness":{
+            "status":"empirically_addressed_not_proven_exhaustive",
+            "evidence":[
+                "strategy_saturation.csv",
+                "unique_outcome_summary.csv",
+                "strategy_pair_disagreement.csv",
+                "leave_one_strategy_out.csv",
+            ]
+        },
+        "Reviewer2_circular_edge_definition":{
+            "status":"resolved_by_redefinition",
+            "evidence":["model_specification.json","edge_witnesses.csv"]
+        },
+        "Reviewer2_ordering_and_Tdepth":{
+            "status":"resolved_by_narrower_interpretation",
+            "evidence":["model_specification.json"]
+        },
+        "Reviewer2_extractor_dependence":{
+            "status":"explicitly_scoped_as_pipeline_relative",
+            "evidence":["model_specification.json","variant_metrics.csv:norm_trace_json"]
+        },
+        "Reviewer2_chromatic_witness":{
+            "status":"answered_by_primary_witness_bundle",
+            "evidence":["PRIMARY_WITNESS/"]
+        },
+        "Reviewer2_verification_failures":{
+            "status":"exhaustively_accounted",
+            "evidence":[
+                "failure_forensics.csv",
+                "publication_scale_conclusion.json",
+            ]
+        },
+        "Reviewer2_benchmark_metadata":{
+            "status":"answered",
+            "evidence":[
+                "benchmark_manifest.csv",
+                "benchmark_family_design.csv",
+                "family_dictionary.csv",
+            ]
+        },
+        "Reviewer2_runtime_scalability":{
+            "status":"answered",
+            "evidence":[
+                "performance_summary.csv",
+                "variant_metrics.csv",
+            ]
+        },
+        "manuscript_only_items":{
+            "status":"not_a_code_question",
+            "items":[
+                "ZX-calculus preliminaries and circuit-to-ZX exposition",
+                "related-work restructuring and citations",
+                "removal of duplicated manuscript sections",
+                "Figure 1/Figure 5 redesign",
+                "practical/theoretical discussion prose",
+                "abstract/introduction/conclusion rewriting",
+            ]
+        }
+    }
+    json_dump(outdir / "reviewer_evidence_manifest.json", manifest)
+
+# =============================================================================
+# Main
+# =============================================================================
+
+def main() -> None:
+    ensure_dir(OUTPUT_DIR)
+
+    print("=" * 78)
+    print("IJQI REPRODUCIBLE RESEARCH ENGINE -- PAULI ANTICOMMUTATION SENSITIVITY")
+    print("=" * 78)
+
+    environment = {
+        "python_version":sys.version,
+        "platform":platform.platform(),
+        "numpy_version":np.__version__,
+        "pandas_version":pd.__version__,
+        "networkx_version":nx.__version__,
+        "analysis_random_seed":ANALYSIS_RANDOM_SEED,
+        "saturation_permutations":SATURATION_PERMUTATIONS,
+        "processor":platform.processor(),
+        "machine":platform.machine(),
+        "qiskit":HAVE_QISKIT,
+        "pyzx":HAVE_PYZX,
+        "pysat":HAVE_PYSAT,
+        "qcec":HAVE_QCEC,
+        "tket":HAVE_TKET,
+        "config":{
+            "include_qiskit_baselines":INCLUDE_QISKIT_BASELINES,
+            "include_tket":INCLUDE_TKET,
+            "pyzx_random_seeds":PYZX_RANDOM_SEEDS,
+            "random_seeds":RANDOM_SEEDS,
+        }
+    }
+    json_dump(OUTPUT_DIR / "environment.json", environment)
 
     if not HAVE_QISKIT:
-        raise RuntimeError(f"Qiskit missing: {globals().get('QISKIT_IMPORT_ERROR','unknown')}")
-    if not HAVE_PYSAT:
-        raise RuntimeError("python-sat is required")
+        raise RuntimeError(
+            f"Qiskit is required: {globals().get('QISKIT_IMPORT_ERROR')}"
+        )
+    if RUN_PROFILE == "paper":
+        missing = [name for name, ok in (
+            ("pyzx", HAVE_PYZX), ("python-sat", HAVE_PYSAT),
+            ("mqt.qcec", HAVE_QCEC)) if not ok]
+        if missing:
+            raise RuntimeError(
+                "Full IJQI reproduction requires the verification backends: "
+                + ", ".join(missing) + ". In Spyder, install them into the "
+                "active interpreter. Do not count UNKNOWN equivalences as verified.")
 
-    specs = make_benchmarks(cfg.mode, cfg.random_seeds, include_grover=cfg.include_grover,
-                            include_qaoa_p2_large=cfg.include_qaoa_p2_large, max_qaoa_p2_n=cfg.max_qaoa_p2_n,
-                            include_random_cnot_t_large=cfg.include_random_cnot_t_large, max_random_cnot_t_n=cfg.max_random_cnot_t_n,
-                            include_hea_large=cfg.include_hea_large, max_hea_n=cfg.max_hea_n)
-    specs += load_qasm_specs(cfg.qasm_dir, limit=cfg.qasm_limit or cfg.max_instances, recursive=cfg.qasm_recursive,
-                             max_qubits=cfg.external_max_qubits, max_ops=cfg.external_max_ops)
-    specs += load_mqtbench_specs(cfg.include_mqtbench, cfg.mode, max_qubits=cfg.external_max_qubits, max_ops=cfg.external_max_ops)
-    specs += load_supermarq_specs(cfg.include_supermarq, cfg.mode, max_qubits=cfg.external_max_qubits, max_ops=cfg.external_max_ops)
-    if cfg.max_instances is not None:
-        specs = specs[:cfg.max_instances]
-    append_log(logp, f"Benchmarks: {len(specs)}")
+    if RUN_CORE_SELF_TESTS:
+        print("\n[1/5] Core self-tests...")
+        st = run_core_self_tests()
+        st.to_csv(OUTPUT_DIR / "self_test_results.csv", index=False)
+        print(st.to_string(index=False))
+        if not bool((st["status"] == "PASS").all()):
+            raise RuntimeError(
+                "Core self-test failed. Pilot aborted."
+            )
 
-    strategies = build_strategies(cfg.random_rewrite_seeds, enable_tket=cfg.enable_tket)
-    if cfg.fast_strategies_only:
-        keep = []
-        for st in strategies:
-            nm = getattr(st, "strategy_name", getattr(st, "__name__", "strategy"))
-            if nm.startswith("qiskit_") or nm in ("pyzx_no_simp", "pyzx_pivot_only", "pyzx_lcomp_only", "pyzx_teleport_reduce"):
-                keep.append(st)
-        strategies = keep
-    strategy_names = [getattr(st, "strategy_name", getattr(st, "__name__", "strategy")) for st in strategies]
-    append_log(logp, f"Strategies: {strategy_names} total={len(strategies)}")
+    benches = make_publication_benchmarks()
+    strategies = build_strategies()
+    if RUN_PROFILE == "witness":
+        benches = [b for b in benches if b.circuit_id == EXPECTED_WITNESS_CIRCUIT]
+        strategies = [s for s in strategies if s.strategy_name in EXPECTED_WITNESS_CHI]
+        if len(benches) != 1 or len(strategies) != 3:
+            raise RuntimeError("Missing canonical VQE witness or its three strategies")
+    elif RUN_PROFILE == "quick":
+        # Different circuit families + canonical witness, without relabeling
+        # these as results of the complete 220-circuit publication design.
+        wanted = {"VQE", "ADD", "TOF", "RCNOTT"}
+        selected = []
+        seen_families = set()
+        for b in benches:
+            if b.family in wanted and b.family not in seen_families:
+                selected.append(b)
+                seen_families.add(b.family)
+        selected.extend(b for b in benches if b.circuit_id == EXPECTED_WITNESS_CIRCUIT
+                        and b.circuit_id not in {x.circuit_id for x in selected})
+        benches = selected
+        strategies = [s for s in strategies if s.strategy_name in
+                      ("pyzx_no_simp", "pyzx_clifford_simp", "pyzx_pivot_only")]
+    elif RUN_PROFILE != "paper":
+        raise ValueError("RUN_PROFILE must be paper, quick, or witness")
+    print("Run profile:", RUN_PROFILE, "| circuits:", len(benches),
+          "| strategies:", len(strategies), flush=True)
+    benchmark_rows = []
+    for manifest_index, b in enumerate(benches, 1):
+        print(f"  Manifest [{manifest_index}/{len(benches)}] {b.circuit_id}", flush=True)
+        br = {
+            "family":b.family,
+            "circuit_id":b.circuit_id,
+            "seed":b.seed,
+            "qubits":b.qc.num_qubits,
+            "ops":len(b.qc.data),
+            "depth":int(b.qc.depth() or 0),
+            "gate_hist_json":json.dumps(gate_histogram(b.qc),sort_keys=True),
+        }
+        try:
+            bct = exact_ct_rebase(b.qc)
+            br["original_CT_rebase_success"] = True
+            br["original_CT_ops"] = int(len(bct.data))
+            br["original_CT_depth"] = int(bct.depth() or 0)
+            br["original_CT_T_count"] = int(sum(
+                inst.operation.name.lower() in ("t","tdg")
+                for inst in bct.data
+            ))
+        except Exception as e:
+            br["original_CT_rebase_success"] = False
+            br["original_CT_error"] = repr(e)
+        benchmark_rows.append(br)
+    benchmark_manifest = pd.DataFrame(benchmark_rows)
+    benchmark_manifest.to_csv(OUTPUT_DIR / "benchmark_manifest.csv", index=False)
+    family_design = benchmark_manifest.groupby("family").agg(
+        circuits=("circuit_id","count"), min_qubits=("qubits","min"),
+        max_qubits=("qubits","max"), min_ops=("ops","min"),
+        max_ops=("ops","max"), min_depth=("depth","min"),
+        max_depth=("depth","max")
+    ).reset_index()
+    family_design.to_csv(OUTPUT_DIR / "benchmark_family_design.csv", index=False)
+
+    print(f"\n[2/5] Benchmarks: {len(benches)} across {benchmark_manifest['family'].nunique()} balanced families")
+    print(f"[3/5] Strategies: {len(strategies)}")
+    print("       " + ", ".join(
+        getattr(s, "__name__", "strategy") for s in strategies[:3]
+    ) + (" ..." if len(strategies) > 3 else ""))
 
     rows: List[Dict[str, Any]] = []
-    completed: set[tuple[str, str]] = set()
-    timeout_counts: Counter[str] = Counter()
-    # Resume support: reuse already completed variant rows from a previous interrupted run.
-    # This is intentionally conservative and only skips rows already present for a circuit/strategy.
-    if cfg.resume:
-        for prev_name in ["variant_metrics_partial.csv", "variant_metrics.csv"]:
-            prev_path = outdir / prev_name
-            if prev_path.exists():
+    graphs: Dict[Tuple[str,str], nx.Graph] = {}
+    completed = set()
+    source_fingerprint = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    integrity_file = OUTPUT_DIR / "run_integrity.json"
+    if RESUME_INTERRUPTED_RUN and (OUTPUT_DIR / "variant_metrics_partial.csv").exists():
+        if not integrity_file.exists():
+            raise RuntimeError("Existing partial run has no integrity fingerprint. "
+                               "Move the output directory aside or disable resume.")
+        previous = json.loads(integrity_file.read_text(encoding="utf-8"))
+        if (previous.get("source_sha256") != source_fingerprint or
+                previous.get("profile") != RUN_PROFILE or
+                previous.get("strategies") != [s.strategy_name for s in strategies]):
+            raise RuntimeError("Partial output was produced with different source/config. "
+                               "A changed scientific pipeline cannot silently resume it.")
+        cached = pd.read_csv(OUTPUT_DIR / "variant_metrics_partial.csv")
+        for item in cached.to_dict("records"):
+            cid, st = str(item.get("circuit_id", "")), str(item.get("strategy", ""))
+            if cid not in {b.circuit_id for b in benches} or st not in {s.strategy_name for s in strategies}:
+                continue
+            if item.get("analysis_success") is True and str(item.get("equiv_status")) == "pass":
+                gp = OUTPUT_DIR / "instances" / cid / st / "anticommutation_graph.graphml"
+                if not gp.is_file():
+                    print("  Resume: missing graph, recomputing", cid, st)
+                    continue
                 try:
-                    prev_df = pd.read_csv(prev_path)
-                    for _, rr in prev_df.iterrows():
-                        cid = str(rr.get("circuit_id", ""))
-                        st = str(rr.get("strategy", ""))
-                        if cid and st:
-                            rows.append(rr.to_dict())
-                            completed.add((cid, st))
-                    append_log(logp, f"Resume loaded {len(completed)} completed variant rows from {prev_name}")
-                    break
-                except Exception as e:
-                    append_log(logp, f"Resume load failed for {prev_name}: {e}")
+                    recovered = nx.read_graphml(gp)
+                    recovered = nx.relabel_nodes(recovered, {v:int(v) for v in recovered.nodes()})
+                    graphs[(cid, st)] = recovered
+                except Exception as err:
+                    print("  Resume: invalid GraphML, recomputing", cid, st, err)
+                    continue
+            rows.append(item)
+            completed.add((cid,st))
+        print(f"  Resume: {len(completed)} previously completed branches reused.", flush=True)
+    else:
+        json_dump(integrity_file, {
+            "source_sha256":source_fingerprint,
+            "profile":RUN_PROFILE,
+            "strategies":[s.strategy_name for s in strategies],
+        })
 
-    for idx, spec in enumerate(specs, start=1):
-        inst_dir = outdir / "instances" / spec.circuit_id
-        ensure_dir(inst_dir)
-        append_log(logp, f"[{idx}/{len(specs)}] {spec.circuit_id} family={spec.family} n={spec.n}")
-        original = transpile_ct(spec.circuit, opt=0)
-        try:
-            save_qasm(original, inst_dir / "original_transpiled.qasm")
-        except Exception as e:
-            append_log(logp, f"save original qasm failed: {e}")
-        json_dump(inst_dir / "original_meta.json", {"family":spec.family, "n":spec.n, "ops":len(original.data), "depth":original.depth(), "gate_hist":gate_histogram(original)})
-        for strat in strategies:
-            strat_name = getattr(strat, "strategy_name", getattr(strat, "__name__", "strategy"))
-            if (spec.circuit_id, strat_name) in completed:
-                continue
-            # If a strategy repeatedly times out, quarantine it for the rest of the run.
-            if cfg.skip_timed_out_strategy_after and timeout_counts[strat_name] >= cfg.skip_timed_out_strategy_after:
-                rows.append({
-                    "family":spec.family, "circuit_id":spec.circuit_id, "n":spec.n, "size_param":spec.size_param, "seed":spec.seed,
-                    "strategy":strat_name, "norm_success":False, "norm_error":"skipped_after_repeated_timeouts",
-                    "analysis_success":False, "equiv_status":"not_run", "failure_category":"timeout_quarantined"
-                })
-                continue
-            if is_known_heavy_case(spec, strat_name, cfg):
-                rows.append({
-                    "family":spec.family, "circuit_id":spec.circuit_id, "n":spec.n, "size_param":spec.size_param, "seed":spec.seed,
-                    "strategy":strat_name, "norm_success":False, "norm_error":"skipped_known_heavy_case",
-                    "analysis_success":False, "equiv_status":"not_run", "failure_category":"known_heavy_skipped",
-                    "known_heavy_policy":"v7.8_workstation_safe_branch_skip"
-                })
-                continue
-            timeout_s = cfg.max_grover_variant_seconds if str(spec.family).lower().startswith("grover") else cfg.max_variant_seconds
+    for i, bench in enumerate(benches, start=1):
+        print(
+            f"\n[{i}/{len(benches)}] "
+            f"{bench.circuit_id}  family={bench.family}"
+        )
+
+        original = bench.qc
+
+        cdir = OUTPUT_DIR / "instances" / bench.circuit_id
+        ensure_dir(cdir)
+
+        if SAVE_QASM:
             try:
-                with time_limit(timeout_s):
-                    norm = strat(original, spec.seed)
-                    row = analyze_variant(spec, norm, original, cfg, inst_dir, logp)
-                rows.append(row)
-            except TimeoutExpired as e:
-                timeout_counts[strat_name] += 1
-                append_log(logp, f"TIMEOUT {spec.circuit_id}/{strat_name}: {e}")
-                rows.append({
-                    "family":spec.family, "circuit_id":spec.circuit_id, "n":spec.n, "size_param":spec.size_param, "seed":spec.seed,
-                    "strategy":strat_name, "norm_success":False, "norm_error":repr(e), "analysis_success":False,
-                    "equiv_status":"not_run", "failure_category":"timeout", "timeout_seconds":timeout_s
-                })
+                (cdir / "original.qasm").write_text(
+                    circuit_to_qasm2(original),
+                    encoding="utf-8"
+                )
+            except Exception:
+                pass
+
+        json_dump(cdir / "original_meta.json", {
+            "family":bench.family,
+            "circuit_id":bench.circuit_id,
+            "qubits":original.num_qubits,
+            "ops":len(original.data),
+            "depth":int(original.depth() or 0),
+            "gate_hist":gate_histogram(original),
+        })
+
+        for strat_fn in strategies:
+            if (bench.circuit_id, strat_fn.strategy_name) in completed:
+                continue
+            # Recover strategy name by one dry attribute-free convention:
+            # each function returns NormResult containing its own name.
+            t_norm0 = time.perf_counter()
+            try:
+                norm = strat_fn(original, bench.seed)
             except Exception as e:
-                rows.append({
-                    "family":spec.family, "circuit_id":spec.circuit_id, "n":spec.n, "size_param":spec.size_param, "seed":spec.seed,
-                    "strategy":strat_name, "norm_success":False, "norm_error":repr(e), "analysis_success":False,
-                    "equiv_status":"not_run", "failure_category":failure_category(strat_name, repr(e), None),
-                    "analysis_traceback":traceback.format_exc()[-3000:]
-                })
-        # incremental save. Writing a large CSV after every instance becomes
-        # increasingly expensive on long runs, so save periodically.
-        if cfg.partial_save_every <= 1 or idx % cfg.partial_save_every == 0 or idx == len(specs):
-            pd.DataFrame(rows).to_csv(outdir / "variant_metrics_partial.csv", index=False)
+                norm = NormResult(
+                    strategy=getattr(strat_fn, "__name__", "unknown_strategy"),
+                    tool="unknown",
+                    success=False,
+                    qc=None,
+                    trace={"traceback":traceback.format_exc()[-3000:]},
+                    error=repr(e),
+                )
+            t_norm1 = time.perf_counter()
+            norm.trace = dict(norm.trace or {})
+            norm.trace["normalization_runtime_s"] = float(t_norm1-t_norm0)
 
-    df = pd.DataFrame(rows)
-    df.to_csv(outdir / "variant_metrics.csv", index=False)
-    circuit_summary, family_summary, counterexamples = classify_groups(df)
-    strategy_summary = strategy_level_summary(df)
-    strategy_health = strategy_health_report(df)
-    explanatory_deltas = explanatory_delta_summary(df)
-    negative_controls = stable_negative_cases(df)
-    scaling = scaling_summary(df)
-    external_summary = external_benchmark_summary(df)
-    # V6 explanatory/mechanistic outputs
-    rewrite_provenance = rewrite_provenance_summary(df, circuit_summary)
-    strategy_pair_matrix = strategy_pair_sensitivity_matrix(df)
-    phase_mechanisms = phase_mechanism_summary(df, circuit_summary)
-    minimal_candidates = minimal_counterexample_candidates(df, counterexamples)
-    family_taxonomy = family_stability_taxonomy(circuit_summary)
-    sat_hardness = sat_hardness_summary(df)
-    # V7 explanation/causality outputs
-    typed_dependency = typed_dependency_summary(df, circuit_summary)
-    spectral_stability = spectral_stability_summary(df, circuit_summary)
-    rewrite_causality = rewrite_causality_matrix(df, circuit_summary)
-    witness_reduction_plan = minimal_witness_reduction_plan(df, minimal_candidates)
-    claim_readiness = paper_claim_readiness_report(df, circuit_summary, strategy_health)
-    circuit_summary.to_csv(outdir / "circuit_summary.csv", index=False)
-    family_summary.to_csv(outdir / "family_summary.csv", index=False)
-    counterexamples.to_csv(outdir / "counterexamples.csv", index=False)
-    strategy_summary.to_csv(outdir / "strategy_summary.csv", index=False)
-    strategy_health.to_csv(outdir / "strategy_health.csv", index=False)
-    explanatory_deltas.to_csv(outdir / "explanatory_deltas.csv", index=False)
-    negative_controls.to_csv(outdir / "negative_controls.csv", index=False)
-    scaling.to_csv(outdir / "scaling_summary.csv", index=False)
-    external_summary.to_csv(outdir / "external_benchmark_summary.csv", index=False)
-    rewrite_provenance.to_csv(outdir / "rewrite_provenance_summary.csv", index=False)
-    strategy_pair_matrix.to_csv(outdir / "strategy_pair_sensitivity_matrix.csv", index=False)
-    phase_mechanisms.to_csv(outdir / "phase_mechanism_summary.csv", index=False)
-    minimal_candidates.to_csv(outdir / "minimal_counterexample_candidates.csv", index=False)
-    family_taxonomy.to_csv(outdir / "family_stability_taxonomy.csv", index=False)
-    sat_hardness.to_csv(outdir / "sat_hardness_summary.csv", index=False)
-    typed_dependency.to_csv(outdir / "typed_dependency_summary.csv", index=False)
-    spectral_stability.to_csv(outdir / "spectral_stability_summary.csv", index=False)
-    rewrite_causality.to_csv(outdir / "rewrite_causality_matrix.csv", index=False)
-    witness_reduction_plan.to_csv(outdir / "minimal_witness_reduction_plan.csv", index=False)
-    claim_readiness.to_csv(outdir / "paper_claim_readiness_report.csv", index=False)
+            sdir = cdir / safe_name(norm.strategy)
 
-    write_latex_tables(outdir, df, circuit_summary, family_summary, counterexamples)
-    plot_outputs(outdir, df, circuit_summary, family_summary)
-    export_counterexample_artifacts(outdir, counterexamples)
+            try:
+                row, G = analyze_normalized_variant(
+                    bench,
+                    norm,
+                    original,
+                    sdir,
+                )
+            except Exception as e:
+                row = {
+                    "family":bench.family,
+                    "circuit_id":bench.circuit_id,
+                    "seed":bench.seed,
+                    "strategy":norm.strategy,
+                    "tool":norm.tool,
+                    "norm_success":bool(norm.success),
+                    "equiv_status":"not_run",
+                    "analysis_success":False,
+                    "failure_category":"analysis_exception",
+                    "analysis_error":repr(e),
+                    "traceback":traceback.format_exc()[-3000:],
+                }
+                G = None
 
-    # Save a concise machine-readable conclusion with careful wording.
-    valid = df[(df.get("analysis_success", False) == True) & (df.get("equiv_status", "") == "pass")]
-    conclusion = {
-        "valid_equivalent_variants": int(len(valid)),
-        "circuits_total": int(len(set(df["circuit_id"]))) if not df.empty else 0,
-        "circuits_summarized": int(len(circuit_summary)) if not circuit_summary.empty else 0,
-        "Lstar_sensitive_circuits": int((circuit_summary["case_class"] == "Lstar_sensitive").sum()) if not circuit_summary.empty else 0,
-        "graph_varies_Lstar_stable_circuits": int((circuit_summary["case_class"] == "graph_varies_Lstar_stable").sum()) if not circuit_summary.empty else 0,
-        "graph_and_Lstar_stable_circuits": int((circuit_summary["case_class"] == "graph_and_Lstar_stable").sum()) if not circuit_summary.empty else 0,
-        "strategy_summary_rows": int(len(strategy_summary)) if not strategy_summary.empty else 0,
-        "strategy_health_rows": int(len(strategy_health)) if not strategy_health.empty else 0,
-        "explanatory_delta_rows": int(len(explanatory_deltas)) if not explanatory_deltas.empty else 0,
-        "negative_control_rows": int(len(negative_controls)) if not negative_controls.empty else 0,
-        "scaling_summary_rows": int(len(scaling)) if not scaling.empty else 0,
-        "external_benchmark_summary_rows": int(len(external_summary)) if not external_summary.empty else 0,
-        "rewrite_provenance_rows": int(len(rewrite_provenance)) if not rewrite_provenance.empty else 0,
-        "strategy_pair_matrix_rows": int(len(strategy_pair_matrix)) if not strategy_pair_matrix.empty else 0,
-        "phase_mechanism_rows": int(len(phase_mechanisms)) if not phase_mechanisms.empty else 0,
-        "minimal_counterexample_candidate_rows": int(len(minimal_candidates)) if not minimal_candidates.empty else 0,
-        "family_taxonomy_rows": int(len(family_taxonomy)) if not family_taxonomy.empty else 0,
-        "sat_hardness_rows": int(len(sat_hardness)) if not sat_hardness.empty else 0,
-        "typed_dependency_rows": int(len(typed_dependency)) if not typed_dependency.empty else 0,
-        "spectral_stability_rows": int(len(spectral_stability)) if not spectral_stability.empty else 0,
-        "rewrite_causality_rows": int(len(rewrite_causality)) if not rewrite_causality.empty else 0,
-        "witness_reduction_plan_rows": int(len(witness_reduction_plan)) if not witness_reduction_plan.empty else 0,
-        "claim_readiness_rows": int(len(claim_readiness)) if not claim_readiness.empty else 0,
-        "claim_guard": "Only variants with equivalence_status=pass are used for sensitivity claims. Unknown/failing equivalence cases are quarantined.",
-        "interpretation": "If Lstar_sensitive_circuits > 0, the run provides empirical evidence that SAT-certified T-layering is normalization-relative for the tested strategies and benchmarks. It is not a proof of general non-invariance unless a minimal symbolic witness is extracted and verified separately.",
-    }
-    json_dump(outdir / "conclusion.json", conclusion)
+            rows.append(row)
 
-    # Package key summaries.
-    try:
-        zpath = outdir / "summary_artifacts.zip"
-        with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
-            for fn in ["variant_metrics.csv", "circuit_summary.csv", "family_summary.csv", "counterexamples.csv", "strategy_summary.csv", "strategy_health.csv", "explanatory_deltas.csv", "negative_controls.csv", "scaling_summary.csv", "external_benchmark_summary.csv", "rewrite_provenance_summary.csv", "strategy_pair_sensitivity_matrix.csv", "phase_mechanism_summary.csv", "minimal_counterexample_candidates.csv", "family_stability_taxonomy.csv", "sat_hardness_summary.csv", "typed_dependency_summary.csv", "spectral_stability_summary.csv", "rewrite_causality_matrix.csv", "minimal_witness_reduction_plan.csv", "paper_claim_readiness_report.csv", "environment.json", "conclusion.json", "run.log"]:
-                p = outdir / fn
-                if p.exists(): z.write(p, arcname=fn)
-            if (outdir / "latex").exists():
-                for p in (outdir / "latex").glob("*.tex"):
-                    z.write(p, arcname=f"latex/{p.name}")
-            if (outdir / "plots").exists():
-                for p in (outdir / "plots").glob("*.pdf"):
-                    z.write(p, arcname=f"plots/{p.name}")
-    except Exception:
-        append_log(logp, "zip packaging failed")
-    append_log(logp, f"Done. Outputs in {outdir}")
-    return conclusion
+            if G is not None:
+                graphs[(bench.circuit_id, norm.strategy)] = G
 
+            print(
+                f"  {norm.strategy:28s} "
+                f"norm={row.get('norm_success')} "
+                f"eq={row.get('equiv_status')} "
+                f"T={row.get('ct_t_count')} "
+                f"E={row.get('graph_edges')} "
+                f"chi={row.get('chi')}"
+            )
 
-def parse_args() -> RunConfig:
-    ap = argparse.ArgumentParser(description="ZX normalization sensitivity experimental engine")
-    ap.add_argument("--outdir", default="artifacts_normsens")
-    mode = ap.add_mutually_exclusive_group()
-    mode.add_argument("--quick", action="store_true")
-    mode.add_argument("--medium", action="store_true")
-    mode.add_argument("--large", action="store_true")
-    ap.add_argument("--angle-tol", type=float, default=ANGLE_TOL_DEFAULT)
-    ap.add_argument("--max-equiv-qubits", type=int, default=10)
-    ap.add_argument("--pairwise-equivalence", action="store_true", help="Currently uses original-vs-variant equivalence guard; kept for compatibility and future pairwise matrix extension.")
-    ap.add_argument("--random-rewrite-seeds", type=int, nargs="*", default=[0,1,2])
-    ap.add_argument("--random-seeds", type=int, nargs="*", default=[0,1,2])
-    ap.add_argument("--max-instances", type=int, default=None)
-    ap.add_argument("--qasm-dir", default=None)
-    ap.add_argument("--qasm-recursive", action="store_true")
-    ap.add_argument("--qasm-limit", type=int, default=None)
-    ap.add_argument("--include-mqtbench", action="store_true", help="Best-effort import from MQTBench if installed.")
-    ap.add_argument("--include-supermarq", action="store_true", help="Best-effort import from SupermarQ if installed.")
-    ap.add_argument("--enable-tket", action="store_true", help="Include tket Peephole/FullPeephole as an explicit optional compiler-normalization baseline.")
-    ap.add_argument("--include-grover", action="store_true", help="Include MCX-heavy Grover-like circuits as optional stress tests. Disabled by default because they can dominate backend runtime.")
-    ap.add_argument("--include-qaoa-p2-large", action="store_true", help="Include all large qaoa_ring p=2 instances. Disabled by default; p=2 is included up to --max-qaoa-p2-n only.")
-    ap.add_argument("--max-qaoa-p2-n", type=int, default=10, help="Largest n for default qaoa_ring/path/star p=2 generated cases. Larger p=2 cases are optional stress tests.")
-    ap.add_argument("--include-random-cnot-t-large", action="store_true", help="Include random_cnot_t instances above --max-random-cnot-t-n as optional stress tests. Disabled by default for workstation-safe publication runs.")
-    ap.add_argument("--max-random-cnot-t-n", type=int, default=10, help="Largest random_cnot_t n included in the main benchmark by default. Larger instances require --include-random-cnot-t-large.")
-    ap.add_argument("--include-hea-large", action="store_true", help="Include hardware-efficient ansatz instances above --max-hea-n as optional stress tests. Disabled by default for workstation-safe publication runs.")
-    ap.add_argument("--max-hea-n", type=int, default=12, help="Largest hardware-efficient ansatz n included in the main benchmark by default. Larger instances require --include-hea-large.")
-    ap.add_argument("--include-qaoa-rr-large", action="store_true", help="Include random-regular QAOA instances above --max-qaoa-rr-n as optional stress tests. Disabled by default for workstation-safe publication runs.")
-    ap.add_argument("--max-qaoa-rr-n", type=int, default=10, help="Largest random-regular QAOA n included in the main benchmark by default. Larger instances require --include-qaoa-rr-large.")
-    ap.add_argument("--random-cnot-t-heavy-n", type=int, default=10, help="From this n onward, skip only heavy random/full ZX and tket branches for random_cnot_t; fast strategies still run.")
-    ap.add_argument("--hea-heavy-n", type=int, default=12, help="From this n onward, skip only heavy random/full ZX and tket branches for hardware-efficient ansatz families; fast strategies still run.")
-    ap.add_argument("--do-not-skip-tket-on-heavy", action="store_true", help="Keep tket branches even on known heavy families/sizes. Not recommended for publication workstation runs.")
-    ap.add_argument("--no-skip-known-heavy-cases", action="store_true", help="Disable workstation-safe skipping of known heavy backend branches.")
-    ap.add_argument("--fast-strategies-only", action="store_true", help="Use only faster Qiskit/PyZX strategies for diagnostic/scaling runs.")
-    ap.add_argument("--external-max-qubits", type=int, default=64)
-    ap.add_argument("--external-max-ops", type=int, default=200000)
-    ap.add_argument("--strict-equivalence", action="store_true", help="Do not analyze unknown-equivalence large proxy variants.")
-    ap.add_argument("--no-graphml", action="store_true")
-    ap.add_argument("--no-qasm", action="store_true")
-    ap.add_argument("--draw-graphs", action="store_true", help="Export dependency-graph PNGs during the run. Disabled by default for speed; GraphML/JSON metrics are still written.")
-    ap.add_argument("--graph-png-max-nodes", type=int, default=80)
-    ap.add_argument("--partial-save-every", type=int, default=5, help="Write variant_metrics_partial.csv every N circuits instead of after every circuit.")
-    ap.add_argument("--max-variant-seconds", type=int, default=180, help="Soft timeout per circuit/strategy variant. Timed-out branches are quarantined, not used for claims.")
-    ap.add_argument("--max-grover-variant-seconds", type=int, default=45, help="Shorter soft timeout for Grover-like MCX-heavy variants.")
-    ap.add_argument("--no-resume", action="store_true", help="Disable resume from existing variant_metrics_partial.csv/variant_metrics.csv in outdir.")
-    ap.add_argument("--skip-timed-out-strategy-after", type=int, default=5, help="Quarantine a strategy after N timeouts across the run. Use 0 to disable.")
-    args = ap.parse_args()
-    m = "quick" if args.quick else "large" if args.large else "medium" if args.medium else "quick"
-    return RunConfig(
-        outdir=args.outdir,
-        mode=m,
-        angle_tol=args.angle_tol,
-        max_equiv_qubits=args.max_equiv_qubits,
-        pairwise_equivalence=args.pairwise_equivalence,
-        random_rewrite_seeds=tuple(args.random_rewrite_seeds),
-        random_seeds=tuple(args.random_seeds),
-        save_graphml=not args.no_graphml,
-        save_qasm=not args.no_qasm,
-        max_instances=args.max_instances,
-        qasm_dir=args.qasm_dir,
-        qasm_recursive=args.qasm_recursive,
-        qasm_limit=args.qasm_limit,
-        include_mqtbench=args.include_mqtbench,
-        include_supermarq=args.include_supermarq,
-        enable_tket=args.enable_tket,
-        include_grover=args.include_grover,
-        include_qaoa_p2_large=args.include_qaoa_p2_large,
-        max_qaoa_p2_n=args.max_qaoa_p2_n,
-        include_random_cnot_t_large=args.include_random_cnot_t_large,
-        max_random_cnot_t_n=args.max_random_cnot_t_n,
-        include_hea_large=args.include_hea_large,
-        max_hea_n=args.max_hea_n,
-        include_qaoa_rr_large=args.include_qaoa_rr_large,
-        max_qaoa_rr_n=args.max_qaoa_rr_n,
-        random_cnot_t_heavy_n=args.random_cnot_t_heavy_n,
-        hea_heavy_n=args.hea_heavy_n,
-        skip_tket_on_medium_large_heavy=(not args.do_not_skip_tket_on_heavy),
-        skip_known_heavy_cases=(not args.no_skip_known_heavy_cases),
-        fast_strategies_only=args.fast_strategies_only,
-        external_max_qubits=args.external_max_qubits,
-        external_max_ops=args.external_max_ops,
-        large_proxy_equiv_unknown_ok=not args.strict_equivalence,
-        draw_graph_png=args.draw_graphs,
-        graph_png_max_nodes=args.graph_png_max_nodes,
-        partial_save_every=max(1, args.partial_save_every),
-        max_variant_seconds=args.max_variant_seconds,
-        max_grover_variant_seconds=args.max_grover_variant_seconds,
-        resume=not args.no_resume,
-        skip_timed_out_strategy_after=args.skip_timed_out_strategy_after,
+        pd.DataFrame(rows).to_csv(
+            OUTPUT_DIR / "variant_metrics_partial.csv",
+            index=False
+        )
+
+    print("\n[4/5] Aggregating exact graph classes and matched-T comparisons...")
+
+    variant_df = pd.DataFrame(rows)
+
+    # First circuit summary assigns exact graph class IDs back into variant_df.
+    circuit_summary = build_circuit_summary(
+        variant_df,
+        graphs
     )
 
+    variant_df.to_csv(
+        OUTPUT_DIR / "variant_metrics.csv",
+        index=False
+    )
+    circuit_summary.to_csv(
+        OUTPUT_DIR / "circuit_summary.csv",
+        index=False
+    )
+    if not circuit_summary.empty:
+        family_summary = circuit_summary.groupby("family").agg(
+            circuits=("circuit_id","count"),
+            graph_sensitive=("graph_sensitive","sum"),
+            chromatic_sensitive=("chromatic_sensitive","sum"),
+            T_matched_graph_sensitive=("T_count_matched_graph_sensitive","sum"),
+            T_matched_chromatic_sensitive=("T_count_matched_chromatic_sensitive","sum"),
+            pyzx_graph_sensitive=("pyzx_graph_sensitive","sum"),
+            pyzx_chromatic_sensitive=("pyzx_chromatic_sensitive","sum")
+        ).reset_index()
+        for c in ["graph_sensitive","chromatic_sensitive","T_matched_graph_sensitive","T_matched_chromatic_sensitive","pyzx_graph_sensitive","pyzx_chromatic_sensitive"]:
+            family_summary[c+"_rate"] = family_summary[c] / family_summary["circuits"]
+        family_summary.to_csv(OUTPUT_DIR / "family_sensitivity_summary.csv", index=False)
 
-if __name__ == "__main__":
-    cfg = parse_args()
+    matched_pairs = build_matched_pair_table(
+        variant_df,
+        graphs
+    )
+    matched_pairs.to_csv(
+        OUTPUT_DIR / "T_count_matched_pairs.csv",
+        index=False
+    )
+
+    witnesses = build_witness_candidates(
+        matched_pairs,
+        variant_df
+    )
+    witnesses.to_csv(
+        OUTPUT_DIR / "witness_candidates.csv",
+        index=False
+    )
+
+    health = strategy_health(variant_df)
+    health.to_csv(
+        OUTPUT_DIR / "strategy_health.csv",
+        index=False
+    )
+
+    repdiag = distinct_representation_diagnostics(variant_df)
+    repdiag.to_csv(
+        OUTPUT_DIR / "representation_diagnostics.csv",
+        index=False
+    )
+
+    forensic = failure_forensics(variant_df)
+    forensic.to_csv(
+        OUTPUT_DIR / "failure_forensics.csv",
+        index=False
+    )
+
+    unique_outcomes = unique_outcome_summary(variant_df)
+    unique_outcomes.to_csv(
+        OUTPUT_DIR / "unique_outcome_summary.csv",
+        index=False
+    )
+
+    primary_witness = write_primary_witness_bundle(
+        matched_pairs,
+        variant_df,
+        OUTPUT_DIR
+    )
+
+    # Reviewer-complete robustness / coverage evidence.
+    write_family_dictionary(OUTPUT_DIR)
+    write_model_specification(OUTPUT_DIR)
+    write_reviewer_evidence_manifest(OUTPUT_DIR)
+
+    strat_pair = strategy_pair_disagreement_matrix(matched_pairs)
+    strat_pair.to_csv(
+        OUTPUT_DIR / "strategy_pair_disagreement.csv", index=False
+    )
+
+    if RUN_STRATEGY_SATURATION:
+        saturation = strategy_saturation_analysis(
+            variant_df, permutations=SATURATION_PERMUTATIONS
+        )
+    else:
+        saturation = pd.DataFrame()
+    saturation.to_csv(
+        OUTPUT_DIR / "strategy_saturation.csv", index=False
+    )
+
+    if RUN_LEAVE_ONE_STRATEGY_OUT:
+        loo = leave_one_strategy_out_analysis(variant_df, graphs)
+    else:
+        loo = pd.DataFrame()
+    loo.to_csv(
+        OUTPUT_DIR / "leave_one_strategy_out.csv", index=False
+    )
+
+    perf = performance_summary(variant_df)
+    perf.to_csv(
+        OUTPUT_DIR / "performance_summary.csv", index=False
+    )
+
+    print("\n[5/5] Publication-scale conclusion...")
+
+    valid = variant_df[
+        (variant_df["analysis_success"] == True) &
+        (variant_df["equiv_status"] == "pass")
+    ].copy()
+
+    result = {
+        "benchmarks":int(len(benches)),
+        "families":int(len(set(b.family for b in benches))),
+        "circuits_per_family_target":int(CIRCUITS_PER_FAMILY) if RUN_PROFILE == "paper" else None,
+        "balanced_suite_locked":bool(LOCK_BALANCED_SUITE and RUN_PROFILE == "paper"),
+        "strategies":int(len(strategies)),
+        "planned_strategy_level_branches":int(len(benches)*len(strategies)),
+        "valid_equivalent_variants":int(len(valid)),
+        "circuits_summarized":int(len(circuit_summary)),
+        "graph_sensitive_circuits":int(
+            circuit_summary["graph_sensitive"].sum()
+        ) if not circuit_summary.empty else 0,
+        "chromatic_sensitive_circuits":int(
+            circuit_summary["chromatic_sensitive"].sum()
+        ) if not circuit_summary.empty else 0,
+        "T_count_matched_graph_sensitive_circuits":int(
+            circuit_summary["T_count_matched_graph_sensitive"].sum()
+        ) if not circuit_summary.empty else 0,
+        "T_count_matched_chromatic_sensitive_circuits":int(
+            circuit_summary["T_count_matched_chromatic_sensitive"].sum()
+        ) if not circuit_summary.empty else 0,
+        "pyzx_graph_sensitive_circuits":int(
+            circuit_summary["pyzx_graph_sensitive"].sum()
+        ) if not circuit_summary.empty else 0,
+        "pyzx_chromatic_sensitive_circuits":int(
+            circuit_summary["pyzx_chromatic_sensitive"].sum()
+        ) if not circuit_summary.empty else 0,
+        "max_chi":int(valid["chi"].max()) if not valid.empty else None,
+        "max_graph_edges":int(valid["graph_edges"].max()) if not valid.empty else None,
+        "max_T_count":int(valid["ct_t_count"].max()) if not valid.empty else None,
+        "matched_pair_rows":int(len(matched_pairs)),
+        "normalization_failures":int(
+            (variant_df.get("failure_category", "") == "normalization_failed").sum()
+        ) if not variant_df.empty else 0,
+        "ct_rebase_failures":int(
+            (variant_df.get("failure_category", "") == "ct_rebase_failed").sum()
+        ) if not variant_df.empty else 0,
+        "exact_CT_model_out_of_domain":int(
+            (variant_df.get("failure_category", "") == "exact_CT_model_out_of_domain").sum()
+        ) if not variant_df.empty else 0,
+        "zero_T_valid_variants":int(
+            (
+                (variant_df.get("analysis_success", False) == True) &
+                (variant_df.get("equiv_status", "") == "pass") &
+                (variant_df.get("zero_T_representation", False) == True)
+            ).sum()
+        ) if not variant_df.empty else 0,
+        "equivalence_failures":int(
+            (variant_df.get("equiv_status", "") == "fail").sum()
+        ) if not variant_df.empty else 0,
+        "equivalence_unknown":int(
+            (variant_df.get("equiv_status", "") == "unknown").sum()
+        ) if not variant_df.empty else 0,
+        "matched_chromatic_sensitive_pairs":int(
+            matched_pairs["chromatic_sensitive"].sum()
+        ) if not matched_pairs.empty else 0,
+        "matched_graph_sensitive_pairs":int(
+            matched_pairs["graph_sensitive"].sum()
+        ) if not matched_pairs.empty else 0,
+        "both_pyzx_matched_chromatic_sensitive_pairs":int(
+            (
+                (matched_pairs["both_pyzx"] == True) &
+                (matched_pairs["chromatic_sensitive"] == True)
+            ).sum()
+        ) if not matched_pairs.empty else 0,
+        "deep_pauli_validated_variants":int(
+            (valid.get("deep_pauli_validation_pass", False) == True).sum()
+        ) if not valid.empty else 0,
+        "direct_signature_validated_variants":int(
+            (valid.get("direct_signature_validation_pass", False) == True).sum()
+        ) if not valid.empty else 0,
+        "rotation_reconstruction_validated_variants":int(
+            (valid.get("rotation_reconstruction_pass", False) == True).sum()
+        ) if not valid.empty else 0,
+        "hand_checkable_exact_chi_variants":int(
+            (valid.get("hand_checkable_exact_chi", False) == True).sum()
+        ) if not valid.empty else 0,
+        "full_direct_validation_completed_variants":int(
+            (valid.get("full_direct_validation_completed", False) == True).sum()
+        ) if not valid.empty else 0,
+        "full_direct_validation_pass_variants":int(
+            (valid.get("full_direct_validation_pass", False) == True).sum()
+        ) if not valid.empty else 0,
+        "primary_witness_available":bool(primary_witness is not None),
+        "primary_witness_circuit":
+            primary_witness.get("circuit_id") if primary_witness else None,
+        "primary_witness_strategies":
+            [primary_witness.get("strategy_A"), primary_witness.get("strategy_B")]
+            if primary_witness else None,
+        "strategy_saturation_rows":int(len(saturation)),
+        "leave_one_strategy_out_rows":int(len(loo)),
+        "strategy_pair_disagreement_rows":int(len(strat_pair)),
+        "performance_summary_rows":int(len(perf)),
+        "original_manuscript_reference":{
+            "circuits":201,"families":22,"strategy_level_executions":2814,
+            "verified_representations":2789,"fully_stable":3,
+            "graph_sensitive_chromatically_stable":145,"chromatically_sensitive":53,
+            "note":"Historical counts used the superseded wire-local model and are not targets."
+        },
+        "design_exceeds_original_scale":bool(len(benches)>201 and len(benches)*len(strategies)>2814),
+        "interpretation_guard":
+            "chi is the exact chromatic number of the Pauli anticommutation graph, "
+            "interpreted as minimum mutually commuting Pauli-signature classes; "
+            "it is not physical T-depth or executable scheduling depth.",
+    }
+
+    # GO / CAUTION / NO-GO logic for the next stage.
+    if (
+        result["T_count_matched_chromatic_sensitive_circuits"] > 0
+        and result["primary_witness_available"]
+    ):
+        result["pilot_decision"] = "GO_STRONG"
+        result["pilot_reason"] = (
+            "At least one exact T-count-matched PyZX chromatic-sensitivity witness "
+            "exists and has been exported as a distinct primary witness bundle."
+        )
+    elif result["T_count_matched_graph_sensitive_circuits"] > 0:
+        result["pilot_decision"] = "GO_GRAPH_ONLY_CAUTION"
+        result["pilot_reason"] = (
+            "T-count-matched graph sensitivity exists, but no matched chromatic "
+            "sensitivity was found in this pilot."
+        )
+    elif result["graph_sensitive_circuits"] > 0:
+        result["pilot_decision"] = "CAUTION_CONFOUNDED"
+        result["pilot_reason"] = (
+            "Graph sensitivity exists only without a T-count-matched witness."
+        )
+    else:
+        result["pilot_decision"] = "NO_GO_CURRENT_CLAIM"
+        result["pilot_reason"] = (
+            "The revised abstraction showed no representation sensitivity in the pilot."
+        )
+
+    json_dump(
+        OUTPUT_DIR / "publication_scale_conclusion.json",
+        result
+    )
+
+    reviewer_summary = f"""V8.4 REVIEWER-COMPLETE RUN SUMMARY
+==================================
+Model:
+  vertices = explicit T/Tdg events after fixed exact Clifford+T rebase
+  edge     = Pauli anticommutation (binary symplectic product = 1)
+  chi      = minimum number of pairwise-commuting Pauli-signature classes
+  nonclaim = not physical T-depth; not executable schedule depth
+
+Coverage:
+  circuits: {result.get('benchmarks')}
+  families: {result.get('families')}
+  strategies: {result.get('strategies')}
+  planned branches: {result.get('planned_strategy_level_branches')}
+  valid equivalent analyzed: {result.get('valid_equivalent_variants')}
+
+Sensitivity:
+  graph-sensitive circuits: {result.get('graph_sensitive_circuits')}
+  chromatically-sensitive circuits: {result.get('chromatic_sensitive_circuits')}
+  T-count-matched graph-sensitive circuits: {result.get('T_count_matched_graph_sensitive_circuits')}
+  T-count-matched chromatically-sensitive circuits: {result.get('T_count_matched_chromatic_sensitive_circuits')}
+  PyZX graph-sensitive circuits: {result.get('pyzx_graph_sensitive_circuits')}
+  PyZX chromatically-sensitive circuits: {result.get('pyzx_chromatic_sensitive_circuits')}
+
+Validation:
+  equivalence failures: {result.get('equivalence_failures')}
+  equivalence unknown: {result.get('equivalence_unknown')}
+  exact-CT out-of-domain: {result.get('exact_CT_model_out_of_domain')}
+  direct validation completed: {result.get('full_direct_validation_completed_variants')}
+  direct validation passed: {result.get('full_direct_validation_pass_variants')}
+  hand-checkable exact chi variants: {result.get('hand_checkable_exact_chi_variants')}
+  primary witness: {result.get('primary_witness_circuit')}
+
+Important:
+  Finite strategy saturation is empirical evidence only, not a proof of exhaustive
+  normalization-space coverage.  The graph and chi are explicitly pipeline-relative.
+"""
+    (OUTPUT_DIR / "reviewer_complete_run_summary.txt").write_text(
+        reviewer_summary, encoding="utf-8"
+    )
+
+    print(json.dumps(result, indent=2, sort_keys=True))
+    print(f"\nOutputs: {OUTPUT_DIR.resolve()}")
+
+    if result["pilot_decision"] == "GO_STRONG":
+        print("\nRESULT: GO_STRONG")
+        print("The next step is a reviewer-complete full run plus explicit witness figures.")
+    elif result["pilot_decision"] == "GO_GRAPH_ONLY_CAUTION":
+        print("\nRESULT: GO_GRAPH_ONLY_CAUTION")
+        print("The original structural-sensitivity claim survives, but the chromatic claim "
+              "needs more evidence or narrower wording.")
+    elif result["pilot_decision"] == "CAUTION_CONFOUNDED":
+        print("\nRESULT: CAUTION_CONFOUNDED")
+        print("Do not launch the full publication run yet.")
+    else:
+        print("\nRESULT: NO_GO_CURRENT_CLAIM")
+        print("Do not launch the full publication run.")
+
+
+
+
+# ========================================================================
+# SINGLE-FILE IJQI PUBLICATION EVIDENCE AND EXACT CHANNEL CERTIFICATION
+# ========================================================================
+from fractions import Fraction as F
+import csv
+import zipfile
+from datetime import datetime, timezone
+
+# The following independent verifier operates over Q(sqrt(2)) using Fractions.
+# Its exact Pauli-transfer coefficients never use floating-point comparison.
+ZERO = (F(0), F(0))
+ONE = (F(1), F(0))
+
+def add(a, b):
+    return a[0] + b[0], a[1] + b[1]
+
+def mulsign(a, s):
+    return a[0] * s, a[1] * s
+
+def divsqrt2(a):
+    return a[1], a[0]/2
+
+def sde(a):
+    # Least k such that (sqrt(2))^k * a belongs to Z[sqrt(2)].
+    for k in range(100):
+        if k % 2 == 0:
+            v = (a[0] * 2**(k//2), a[1] * 2**(k//2))
+        else:
+            v = (a[1]*2**((k+1)//2), a[0]*2**(k//2))
+        if v[0].denominator == 1 and v[1].denominator == 1:
+            return k
+    raise ArithmeticError('SDE unexpectedly large')
+
+SINGLE = {
+ 'h': {'I':('I',1),'X':('Z',1),'Y':('Y',-1),'Z':('X',1)},
+ 's': {'I':('I',1),'X':('Y',1),'Y':('X',-1),'Z':('Z',1)},
+ 'sdg': {'I':('I',1),'X':('Y',-1),'Y':('X',1),'Z':('Z',1)},
+ 'x': {'I':('I',1),'X':('X',1),'Y':('Y',-1),'Z':('Z',-1)},
+ 'z': {'I':('I',1),'X':('X',-1),'Y':('Y',-1),'Z':('Z',1)},
+}
+P1 = {'I':np.eye(2), 'X':np.array([[0,1],[1,0]]), 'Y':np.array([[0,-1j],[1j,0]]), 'Z':np.diag([1,-1])}
+CX = np.array([[1,0,0,0], [0,1,0,0], [0,0,0,1], [0,0,1,0]],dtype=complex)
+CXMAP = {}
+for a in 'IXYZ':
+ for b in 'IXYZ':
+  M = CX @ np.kron(P1[a],P1[b]) @ CX.conj().T
+  sols = [(x,y,sign) for x in 'IXYZ' for y in 'IXYZ' for sign in [1,-1]
+          if np.allclose(M,sign*np.kron(P1[x],P1[y]),atol=1e-13)]
+  assert len(sols)==1, (a,b,sols)
+  CXMAP[a,b] = sols[0]
+
+INST = re.compile(r'^\s*(h|x|z|s|sdg|t|tdg|cx|id)\s+q\[(\d+)\](?:\s*,\s*q\[(\d+)\])?\s*;\s*$', re.I)
+QREG = re.compile(r'^\s*qreg\s+q\[(\d+)\];',re.I)
+
+def parse_qasm(qasm):
+ n=None;ops=[]
+ for line in qasm.splitlines():
+  line=line.split('//',1)[0].strip()
+  if not line:continue
+  qreg=QREG.match(line)
+  if qreg:n=int(qreg.group(1));continue
+  if line.startswith(('OPENQASM','include','barrier')):continue
+  m=INST.match(line)
+  if not m: raise ValueError('Unsupported QASM line: '+line)
+  gate=m.group(1).lower();qs=tuple(int(v) for v in m.groups()[1:] if v is not None)
+  if n is None:raise ValueError('Qreg must come before gates')
+  ops.append((gate,qs))
+ assert n is not None
+ return n,ops
+
+def transform(d,gate,qs):
+ out={}
+ def accum(st,c):
+  out[st]=add(out.get(st,ZERO),c)
+ for st,c in d.items():
+  q=list(st)
+  if gate in SINGLE:
+   v,sign=SINGLE[gate][q[qs[0]]]
+   q[qs[0]]=v
+   accum(''.join(q),mulsign(c,sign))
+  elif gate in ('t','tdg'):
+   idx=qs[0]
+   if q[idx] in ('I','Z'):accum(st,c);continue
+   sgn=1 if gate=='t' else -1
+   accum(st,divsqrt2(c))
+   q[idx]='Y' if q[idx]=='X' else 'X'
+   # T: X -> +Y, Y -> -X ; inverse signs for Tdg.
+   new_sign=sgn*(1 if st[idx]=='X' else -1)
+   accum(''.join(q),mulsign(divsqrt2(c),new_sign))
+  elif gate=='cx':
+   ct,tg=qs
+   x,y,sign=CXMAP[q[ct],q[tg]]
+   q[ct]=x;q[tg]=y
+   accum(''.join(q),mulsign(c,sign))
+  elif gate=='id':accum(st,c)
+  else: raise ValueError(gate)
+ return {p:c for p,c in out.items() if c!=ZERO}
+
+def exact_channel(qasm):
+ n,ops=parse_qasm(qasm)
+ result={}
+ for inp in map(''.join,itertools.product('IXYZ',repeat=n)):
+  d={inp:ONE}
+  for g,qs in ops:d=transform(d,g,qs)
+  for oup,c in d.items():result[(inp,oup)]=c
+ return result
+
+def verify(qasm):
+ n,ops=parse_qasm(qasm)
+ if n>6:raise ValueError('Restricted to <=6 qubits for exact enumeration')
+ t_count=sum(g in ('t','tdg') for g,qs in ops)
+ max_sde=0;witness=None;stats=Counter()
+ for inp in map(''.join,itertools.product('IXYZ',repeat=n)):
+  d={inp:ONE}
+  for g,qs in ops:d=transform(d,g,qs)
+  for oup,c in d.items():
+   v=sde(c)
+   stats[v]+=1
+   if v>max_sde:
+    max_sde=v;witness=(inp,oup,str(c[0]),str(c[1]))
+ return {'qubits':n,'T_count':t_count,'max_channel_sde':max_sde,
+         'certifying_entry':witness,'sde_distribution':dict(sorted(stats.items())),
+         'T_count_optimal':max_sde==t_count}
+
+
+
+
+def _is_linearly_independent_paulis(labels):
+    basis = {}
+    for label in labels:
+        chars = str(label)
+        bits = tuple(int(c in 'XY') for c in chars) + tuple(int(c in 'YZ') for c in chars)
+        v = sum(b << i for i, b in enumerate(bits))
+        while v:
+            leading = v.bit_length() - 1
+            if leading in basis:
+                v ^= basis[leading]
+            else:
+                basis[leading] = v
+                break
+        else:
+            return False
+    return True
+
+
+def _label_symplectic(a, b):
+    if len(a) != len(b):
+        raise ValueError("Mismatched Pauli label lengths")
+    xa = [c in 'XY' for c in a]
+    za = [c in 'YZ' for c in a]
+    xb = [c in 'XY' for c in b]
+    zb = [c in 'YZ' for c in b]
+    return sum(int(xa[i] and zb[i]) + int(za[i] and xb[i])
+               for i in range(len(a))) % 2
+
+
+def _four_axis_common_frame(a, b):
+    """Check the independent-subset symplectic Gram criterion.
+
+    The result is a Clifford existence claim, not a concrete Clifford circuit,
+    and does not assert any single ZX rewrite changes only one event.
+    """
+    if len(a) != len(b) or len(a) < 4:
+        return {"status":"not_applicable"}
+    for ai in itertools.combinations(range(len(a)), 4):
+        la = [a[i] for i in ai]
+        if not _is_linearly_independent_paulis(la):
+            continue
+        ga = tuple(tuple(_label_symplectic(x,y) for y in la) for x in la)
+        for bi in itertools.permutations(range(len(b)), 4):
+            lb = [b[i] for i in bi]
+            if not _is_linearly_independent_paulis(lb):
+                continue
+            gb = tuple(tuple(_label_symplectic(x,y) for y in lb) for x in lb)
+            if ga == gb:
+                return {"status":"CERTIFIED", "indices_A":list(ai),
+                        "indices_B":list(bi), "Paulis_A":la, "Paulis_B":lb,
+                        "joint_symplectic_gram":ga,
+                        "interpretation":"4 projective Pauli axes admit a common Clifford mapping up to signs; this is not a gate-level ZX trace"}
+    return {"status":"NOT_FOUND"}
+
+
+def _read_witness_branch(result_dir, strategy):
+    p = result_dir / "instances" / EXPECTED_WITNESS_CIRCUIT / strategy
+    report_path = p / "variant_report.json"
+    if not report_path.exists():
+        raise FileNotFoundError(f"No successfully analyzed witness branch: {report_path}")
+    rep = json.loads(report_path.read_text(encoding="utf-8"))
+    events = list(csv.DictReader((p / "pauli_events.csv").open(encoding="utf-8",newline="")))
+    graph = nx.read_graphml(p / "anticommutation_graph.graphml")
+    graph = nx.relabel_nodes(graph, {v: int(v) for v in graph.nodes()})
+    ct = (p / "rebased_ct.qasm").read_text(encoding="utf-8")
+    sigs = [r["pauli"] for r in events]
+    for i,j in itertools.combinations(range(len(sigs)), 2):
+        if graph.has_edge(i,j) != bool(_label_symplectic(sigs[i],sigs[j])):
+            raise AssertionError(f"Pauli event and GraphML edge disagree: {strategy} {i},{j}")
+    cert=rep.get("coloring_certificate",{})
+    row=rep["row"]
+    if not (row.get("equiv_status") == "pass" and
+            row.get("analysis_success") is True and
+            cert.get("proper_coloring_valid") is True and
+            cert.get("hand_checkable_exact") is True and
+            int(cert.get("clique_size",-1)) == int(row.get("chi",-2))):
+        raise AssertionError(f"Uncertified witness branch: {strategy}")
+    return {"directory":p, "report":rep, "events":events, "graph":graph,
+            "qasm":ct, "pauli_labels":sigs, "chi":int(row["chi"]),
+            "T_count":int(row["ct_t_count"]),
+            "clique":cert.get("maximum_clique_witness",[])}
+
+
+def _export_3graph_figure(branches, dst):
     try:
-        conclusion = run(cfg)
-        print(json.dumps(conclusion, indent=2, sort_keys=True))
-    except Exception as e:
-        print("FATAL:", repr(e), file=sys.stderr)
-        traceback.print_exc()
-        sys.exit(2)
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.patches import Patch
+        fig, axes = plt.subplots(1,3,figsize=(14.5,4.5))
+        for ax, (name, br) in zip(axes, branches.items()):
+            g=br['graph']
+            pos=nx.spring_layout(g,seed=42) if g.number_of_nodes() else {}
+            color_obj=br['report'].get('coloring',{})
+            colors=[int(color_obj.get(str(v),color_obj.get(v,0))) for v in g.nodes()]
+            palette=['#2f8f85','#d49245','#8170ba','#5a8db5','#bf5b65','#9a9b61']
+            nx.draw_networkx(g,pos=pos,ax=ax,with_labels=False,node_size=1000,
+                             edge_color='#64748b',width=2.0,
+                             node_color=[palette[c%len(palette)] for c in colors])
+            for v,(x,y) in pos.items():
+                ax.text(x,y,str(v)+':'+br['pauli_labels'][v],color='white',
+                        ha='center',va='center',fontsize=8,fontweight='bold')
+            ax.set_title(f"{name.replace('pyzx_','')}  |  T={br['T_count']}, "
+                         f"omega={len(br['clique'])}, chi={br['chi']}")
+            ax.axis('off')
+        fig.tight_layout()
+        for ext in ['png','pdf']:
+            fig.savefig(dst.with_suffix('.'+ext),dpi=190,bbox_inches='tight')
+        plt.close(fig)
+        return True
+    except Exception as exc:
+        (dst.parent/'figure_warning.txt').write_text(repr(exc),encoding='utf-8')
+        return False
+
+
+def _zx_graph_snapshot(g, label, root):
+    """Export ACTUAL regenerated ZX graph, not the generic ZX gate legend."""
+    ensure_dir(root)
+    coords, nodes, edges = {}, [], []
+    def read_attr(attr, v, default=None):
+        try:
+            p = getattr(g, attr, None)
+            if p is None: return default
+            return p(v) if callable(p) else default
+        except Exception:
+            return default
+    for v in g.vertices():
+        vid=int(v)
+        row=read_attr('row',v,vid)
+        qb=read_attr('qubit',v,0)
+        coords[vid]=(float(row),-float(qb))
+        nodes.append({"id":vid, "row":str(row), "qubit":str(qb),
+                      "type":str(read_attr('type',v)),
+                      "phase":str(read_attr('phase',v))})
+    for e in g.edges():
+        u,v=(int(x) for x in tuple(e))
+        edges.append({"u":u,"v":v,"edge_type":str(read_attr('edge_type',e))})
+    obj={"label":label,"vertices":nodes,"edges":edges,
+         "vertex_count":len(nodes),"edge_count":len(edges)}
+    json_dump(root/(label+'.json'),obj)
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        fig,ax=plt.subplots(figsize=(13,5))
+        for edge in edges:
+            u,v=edge['u'],edge['v']
+            x0,y0=coords[u];x1,y1=coords[v]
+            is_h=('HAD' in edge['edge_type'].upper() or
+                  edge['edge_type'] in ('2','EdgeType.H'))
+            ax.plot([x0,x1],[y0,y1],color=('#8560ad' if is_h else '#708190'),
+                    linestyle=('--' if is_h else '-'),linewidth=0.85,zorder=1)
+        for node in nodes:
+            x,y=coords[node['id']]
+            t=node['type'].upper()
+            color='#239957' if ('Z' in t or t=='1') else ('#cd6767' if ('X' in t or t=='2') else 'white')
+            ax.scatter([x],[y],s=48,facecolors=color,edgecolors='black',linewidths=.6,zorder=2)
+            phase=node['phase']
+            if phase not in ('None','0','0.0','0/1'):
+                ax.text(x,y+0.18,phase,fontsize=6,ha='center')
+        ax.set_title(f"{label} | {len(nodes)} vertices, {len(edges)} edges")
+        ax.set_aspect('equal',adjustable='datalim')
+        ax.axis('off')
+        fig.tight_layout()
+        fig.savefig(root/(label+'.svg'),bbox_inches='tight')
+        fig.savefig(root/(label+'.png'),dpi=150,bbox_inches='tight')
+        plt.close(fig)
+    except Exception as exc:
+        obj['image_export_warning']=repr(exc)
+        json_dump(root/(label+'.json'),obj)
+    return obj
+
+
+def _fresh_zx_snapshots(original, modes, branches, witness_dir):
+    if not HAVE_PYZX:
+        return {"status":"UNAVAILABLE", "reason":"PyZX not installed"}
+    summary={}
+    for st,mode in modes.items():
+        outdir=witness_dir/st/'ZX_diagrams'
+        ensure_dir(outdir)
+        try:
+            op=[]
+            g=zx.Circuit.from_qasm(circuit_to_qasm2(original)).to_graph()
+            a=_zx_graph_snapshot(g,'01_raw_input',outdir)
+            g,_,_=pyzx_common_graphlike_preprocess(g,op)
+            b=_zx_graph_snapshot(g,'02_common_graphlike',outdir)
+            g=_apply_pyzx_strategy(g,mode,random.Random(7),1,op)
+            c=_zx_graph_snapshot(g,'03_post_rewrite',outdir)
+            normalized=_pyzx_extract_to_qiskit(g,op)
+            normalized=qiskit_basis_preserving_transpile(normalized,0)
+            ct=exact_ct_rebase(normalized)
+            labels=[e.pauli.label() for e in extract_pauli_events(ct)]
+            ref_labels=branches[st]['pauli_labels']
+            equiv=operator_equiv_up_to_phase(original,normalized,max_qubits=8)
+            branch_matches=(labels==ref_labels)
+            status=('PASS' if equiv is True and branch_matches else 'MISMATCH')
+            summary[st]={"status":status,"equivalent_to_original":equiv,
+                         "Pauli_event_list_matches_main_run":branch_matches,
+                         "post_rewrite_size":[c['vertex_count'],c['edge_count']],
+                         "common_size":[b['vertex_count'],b['edge_count']],
+                         "original_size":[a['vertex_count'],a['edge_count']],
+                         "operations":op}
+        except Exception as exc:
+            summary[st]={"status":"ERROR","error":repr(exc),
+                         "traceback":traceback.format_exc()[-3500:]}
+    json_dump(witness_dir/'fresh_ZX_snapshot_validation.json',summary)
+    return summary
+
+
+def _draw_complete_circuit(qasm, output_path):
+    try:
+        if not HAVE_QISKIT:
+            raise ImportError('Qiskit absent; using independent QASM figure')
+        qc=circuit_from_qasm2(qasm)
+        (output_path.with_suffix('.txt')).write_text(
+             str(qc.draw(output='text',fold=105)),encoding='utf-8')
+        fig=qc.draw(output='mpl',fold=25,idle_wires=True)
+        fig.savefig(output_path,dpi=170,bbox_inches='tight')
+        import matplotlib.pyplot as plt
+        plt.close(fig)
+        return 'PASS'
+    except Exception as exc:
+        # Qiskit Matplotlib drawings may require optional pylatexenc. Reconstruct
+        # an exact, complete sequential gate diagram directly from QASM instead.
+        try:
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+            n,ops=parse_qasm(qasm)
+            per_row=22
+            chunks=[ops[i:i+per_row] for i in range(0,len(ops),per_row)]
+            fig,ax=plt.subplots(figsize=(15,max(2.8,2.0*len(chunks))))
+            ti=0
+            for rowno,chunk in enumerate(chunks):
+                offset=rowno*(n+1.3)
+                for q in range(n):
+                    y=offset+q
+                    ax.plot([0.5,per_row+1],[y,y],color='#94a3b8',linewidth=1)
+                    ax.text(0.2,y,f'q{q}',va='center',ha='right',fontsize=9)
+                for j,(gate,qs) in enumerate(chunk,1):
+                    x=j+0.05
+                    if gate=='cx':
+                        c,t=qs
+                        yy1,yy2=offset+c,offset+t
+                        ax.plot([x,x],[yy1,yy2],color='#374151',lw=1.5)
+                        ax.plot(x,yy1,'o',ms=4,color='#374151')
+                        ax.plot(x,yy2,'o',ms=13,mfc='white',mec='#374151')
+                        ax.plot([x-.2,x+.2],[yy2,yy2],color='#374151',lw=1)
+                        ax.plot([x,x],[yy2-.2,yy2+.2],color='#374151',lw=1)
+                    else:
+                        q=qs[0]
+                        tlike=gate in ('t','tdg')
+                        label=(f'{gate.upper()}\nT{ti}' if tlike else gate.upper())
+                        if tlike:ti+=1
+                        ax.text(x,offset+q,label,ha='center',va='center',fontsize=7,
+                           bbox=dict(facecolor=('#3b82f6' if tlike else '#f1f5f9'),
+                                     edgecolor='#334155',boxstyle='round,pad=.22'),
+                           color=('white' if tlike else 'black'))
+            ax.set_xlim(0,per_row+1.3)
+            ax.set_ylim(-.5,len(chunks)*(n+1.3))
+            ax.invert_yaxis()
+            ax.axis('off')
+            fig.tight_layout()
+            fig.savefig(output_path,dpi=170,bbox_inches='tight')
+            fig.savefig(output_path.with_suffix('.pdf'),bbox_inches='tight')
+            plt.close(fig)
+            return 'PASS_FALLBACK_COMPLETE_GATE_SEQUENCE'
+        except Exception as fallback_exc:
+            return 'IMAGE_UNAVAILABLE: '+repr(exc)+'; fallback='+repr(fallback_exc)
+
+
+def _write_k_coloring_dimacs(graph, k, path):
+    nodes=sorted(int(v) for v in graph.nodes())
+    idx={node:j for j,node in enumerate(nodes)}
+    def v(node,c):return 1 + idx[int(node)]*k + c
+    clauses=[]
+    for node in nodes:
+        clauses.append([v(node,c) for c in range(k)])
+        for a in range(k):
+            for b in range(a+1,k):
+                clauses.append([-v(node,a),-v(node,b)])
+    for a,b in graph.edges():
+        for c in range(k):
+            clauses.append([-v(a,c),-v(b,c)])
+    lines=[f"p cnf {len(nodes)*k} {len(clauses)}"]
+    lines.extend(' '.join(str(x) for x in clause)+' 0' for clause in clauses)
+    path.write_text('\n'.join(lines)+'\n',encoding='utf-8')
+    return {"variables":len(nodes)*k,"clauses":len(clauses)}
+
+
+def produce_canonical_witness_evidence(result_dir):
+    """Derive ALL witness evidence from freshly produced QASM files.
+
+    No external archive is read; witness and channel claims FAIL CLOSED.
+    """
+    witness_dir=result_dir/'paper_witness'
+    ensure_dir(witness_dir)
+    summary={"created_at":datetime.now(timezone.utc).isoformat(),
+             "circuit_id":EXPECTED_WITNESS_CIRCUIT,"profile":RUN_PROFILE,
+             "expected_chi":EXPECTED_WITNESS_CHI,"branches":{}}
+    try:
+        branches={name:_read_witness_branch(result_dir,name)
+                  for name in EXPECTED_WITNESS_CHI}
+        channels={}
+        for name, branch in branches.items():
+            outdir=witness_dir/name
+            ensure_dir(outdir)
+            qasm=branch['qasm']
+            n,ops=parse_qasm(qasm)
+            if n != 4 or sum(g in ('t','tdg') for g,_ in ops) != 5:
+                raise AssertionError('Canonical witness must have 4 qubits and 5 explicit T events')
+            cert=verify(qasm)
+            channel=exact_channel(qasm)
+            channels[name]=channel
+            if cert['max_channel_sde'] != 5 or not cert['T_count_optimal']:
+                raise AssertionError('Five-T minimality not certified')
+            if branch['T_count']!=5 or branch['chi']!=EXPECTED_WITNESS_CHI[name]:
+                raise AssertionError('Unexpected witness T-count or chromatic number: '+name)
+            G=branch['graph']
+            for k in range(1,branch['chi']+1):
+                _write_k_coloring_dimacs(G,k,outdir/f"{k}_coloring.cnf")
+            drawing=_draw_complete_circuit(qasm,outdir/'complete_CT_circuit.png')
+            (outdir/'rebased_ct.qasm').write_text(qasm,encoding='utf-8')
+            summary['branches'][name]={"status":"PASS","T_count":branch['T_count'],
+                "chi":branch['chi'],"edges":int(G.number_of_edges()),
+                "omega":len(branch['clique']),"T_count_certificate":cert,
+                "channel_nonzero_entries":len(channel),
+                "complete_CT_circuit_image":drawing}
+        base=channels['pyzx_no_simp']
+        exact_same=all(channel==base for channel in channels.values())
+        if not exact_same:
+            raise AssertionError('Exact Pauli-transfer matrices are not identical')
+        summary['exact_projective_unitary_equality']=True
+        summary['certified_min_ancilla_free_T_count']=5
+        summary['channel_matrix_dimension']=4**4
+        summary['distinct_nonzero_channel_entries']=len(base)
+        summary['all_three_chi']=[branches[s]['chi'] for s in EXPECTED_WITNESS_CHI]
+        summary['clifford_frame_four_axis_comparison']=_four_axis_common_frame(
+            branches['pyzx_no_simp']['pauli_labels'],
+            branches['pyzx_clifford_simp']['pauli_labels'])
+        summary['three_graphs_drawn']=_export_3graph_figure(
+            branches,witness_dir/'three_Pauli_graphs')
+        # Reproduce actual ZX intermediate graphs using a SEPARATE fresh path.
+        if SAVE_ZX_WITNESS_SNAPSHOTS:
+            orig_path=result_dir/'instances'/EXPECTED_WITNESS_CIRCUIT/'original.qasm'
+            original=circuit_from_qasm2(orig_path.read_text(encoding='utf-8'))
+            summary['fresh_ZX_snapshots']=_fresh_zx_snapshots(original,{
+                'pyzx_no_simp':'none','pyzx_clifford_simp':'clifford_simp',
+                'pyzx_pivot_only':'pivot_only'},branches,witness_dir)
+            if not all(v.get('status')=='PASS' for v in summary['fresh_ZX_snapshots'].values()):
+                summary['ZX_snapshots_match']=False
+                summary['warnings']=['At least one fresh ZX trace differs from saved branch']
+            else:
+                summary['ZX_snapshots_match']=True
+        summary['status']='PASS' if summary.get('ZX_snapshots_match',True) else 'PARTIAL'
+    except Exception as exc:
+        summary['status']='FAIL'
+        summary['error']=repr(exc)
+        summary['traceback']=traceback.format_exc()[-5500:]
+    json_dump(witness_dir/'EXACT_WITNESS_CERTIFICATE.json',summary)
+    return summary
+
+
+def _paper_family_table(result_dir):
+    p=result_dir/'variant_metrics.csv'
+    if not p.exists():return None
+    df=pd.read_csv(p)
+    base=pd.read_csv(result_dir/'benchmark_manifest.csv')
+    fam=pd.read_csv(result_dir/'family_sensitivity_summary.csv') if (result_dir/'family_sensitivity_summary.csv').exists() else pd.DataFrame()
+    valid=df[(df['analysis_success']==True)&(df['equiv_status']=='pass')].copy()
+    rows=[]
+    for family, grp in base.groupby('family'):
+        d=valid[valid['family']==family]
+        fs=fam[fam['family']==family] if not fam.empty else pd.DataFrame()
+        rows.append({
+          'family':family, 'circuits':len(grp),
+          'min_qubits':int(grp['qubits'].min()),'max_qubits':int(grp['qubits'].max()),
+          'min_input_ops':int(grp['ops'].min()),'max_input_ops':int(grp['ops'].max()),
+          'min_original_T_count':int(pd.to_numeric(grp['original_CT_T_count'],errors='coerce').min()) if grp['original_CT_T_count'].notna().any() else None,
+          'max_original_T_count':int(pd.to_numeric(grp['original_CT_T_count'],errors='coerce').max()) if grp['original_CT_T_count'].notna().any() else None,
+          'T_matched_chromatic_sensitive':int(fs['T_matched_chromatic_sensitive'].iloc[0]) if not fs.empty else None,
+          'valid_branches':len(d),
+          'median_exact_coloring_seconds':float(pd.to_numeric(d['exact_coloring_runtime_s'],errors='coerce').median()) if not d.empty else None,
+          'max_graph_vertices':int(d['graph_nodes'].max()) if not d.empty else None,
+          'max_graph_edges':int(d['graph_edges'].max()) if not d.empty else None,
+          'median_SAT_variables':float(pd.to_numeric(d['sat_chi_variables'],errors='coerce').median()) if not d.empty else None,
+          'median_SAT_clauses':float(pd.to_numeric(d['sat_chi_clauses'],errors='coerce').median()) if not d.empty else None,
+        })
+    result=pd.DataFrame(rows).sort_values('family')
+    out=result_dir/'paper_ready'
+    ensure_dir(out)
+    result.to_csv(out/'benchmark_family_size_runtime_table.csv',index=False)
+    result[['family','circuits','min_qubits','max_qubits',
+            'min_original_T_count','max_original_T_count',
+            'T_matched_chromatic_sensitive','median_exact_coloring_seconds']].to_latex(
+        out/'benchmark_family_size_runtime_table.tex',index=False,
+        float_format='%.4f',escape=True)
+    return result
+
+
+def _paper_plots(result_dir,family_table):
+    if family_table is None or family_table.empty or not EXPORT_PAPER_FIGURES:
+        return []
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        out=result_dir/'paper_ready'
+        names=[]
+        data=family_table.sort_values('T_matched_chromatic_sensitive',ascending=False)
+        fig,ax=plt.subplots(figsize=(13,5))
+        ax.bar(data['family'],data['T_matched_chromatic_sensitive'])
+        ax.set_ylabel('T-count-matched chromatically sensitive circuits')
+        ax.set_xlabel('Benchmark family (10 circuits each in paper profile)')
+        ax.set_title('Exact Pauli-graph chromatic sensitivity by family')
+        ax.tick_params(axis='x',labelrotation=55)
+        fig.tight_layout()
+        for ext in ['png','pdf']:
+            name='family_matched_chromatic_sensitivity.'+ext
+            fig.savefig(out/name,dpi=190,bbox_inches='tight');names.append(name)
+        plt.close(fig)
+        fig,ax=plt.subplots(figsize=(9,5))
+        df=pd.read_csv(result_dir/'variant_metrics.csv')
+        valid=df[(df['analysis_success']==True)&(df['equiv_status']=='pass')]
+        ax.scatter(valid['ct_t_count'],valid['chi'],s=9,alpha=.3)
+        ax.set_xlabel('Explicit post-rebase T count')
+        ax.set_ylabel('Chromatic number of Pauli anticommutation graph')
+        ax.set_title('Chi is an algebraic commuting-class descriptor, not T depth')
+        fig.tight_layout()
+        for ext in ['png','pdf']:
+            name='T_count_vs_chi.'+ext
+            fig.savefig(out/name,dpi=190,bbox_inches='tight');names.append(name)
+        plt.close(fig)
+        return names
+    except Exception as exc:
+        (result_dir/'paper_ready'/'plot_warning.txt').write_text(repr(exc),encoding='utf-8')
+        return []
+
+
+def _paper_claim_consistency(result_dir, witness):
+    core=json.loads((result_dir/'publication_scale_conclusion.json').read_text(encoding='utf-8'))
+    keys={'benchmarks':220,'families':22,'strategies':13,
+          'planned_strategy_level_branches':2860,'valid_equivalent_variants':2842,
+          'T_count_matched_graph_sensitive_circuits':61,
+          'T_count_matched_chromatic_sensitive_circuits':39}
+    rows={key:{'expected':expected,'observed':core.get(key),
+               'match':core.get(key)==expected} for key,expected in keys.items()}
+    # These are comparisons to the fixed manuscript data, NOT forced results.
+    # A witness/quick run does not contain 220 circuits; comparing its
+    # totals with the paper benchmark is not a scientific mismatch.
+    # Report the scope explicitly while keeping the witness result separate.
+    if RUN_PROFILE == 'paper':
+        paper_status = ('MATCH' if all(x['match'] for x in rows.values()) and
+                        witness.get('status') == 'PASS' else 'MISMATCH')
+    else:
+        paper_status = 'NOT_APPLICABLE_PARTIAL_PROFILE'
+    results={"profile":RUN_PROFILE,"benchmarks":rows,
+      "status":paper_status,
+      "witness_status":witness.get('status'),
+      "warning":"MISMATCH does not mean the new run is invalid. Determine dependency versions, normalization/CT exclusions, and benchmark selection before comparing with the published 2026 dataset.",
+      "expected_historical_run_failure_counts":{
+          "equivalence_failed":2,"exact_CT_model_out_of_domain":16},
+      "not_claimed":"These counts are dependent on the specified tool versions and accepted-branch policy."}
+    json_dump(result_dir/'PAPER_CLAIM_VALIDATION.json',results)
+    return results
+
+
+
+
+def independent_pauli_from_qasm(qasm):
+    """Second implementation of suffix Clifford propagation, with integer bitsets.
+
+    Unlike extract_pauli_events(), this method constructs no numpy matrices.
+    In the reverse gate scan, images of the 2n Pauli basis vectors under the
+    current Clifford suffix are updated using only XOR and column swaps.
+    It is projective (Pauli signs are irrelevant for anticommutation).
+    """
+    n, ops = parse_qasm(qasm)
+    columns = [1 << j for j in range(2*n)]
+    events = []
+    for gate, qs in reversed(ops):
+        if gate in ('t','tdg'):
+            q=qs[0]
+            bits=columns[n+q]
+            letters=[]
+            for k in range(n):
+                x=(bits>>k)&1
+                z=(bits>>(n+k))&1
+                letters.append('I' if not x and not z else
+                               'X' if x and not z else
+                               'Z' if z and not x else 'Y')
+            events.append((gate,q,''.join(letters)))
+        elif gate=='h':
+            q=qs[0]
+            columns[q],columns[n+q]=columns[n+q],columns[q]
+        elif gate in ('s','sdg'):
+            q=qs[0]
+            columns[q] ^= columns[n+q]
+        elif gate=='cx':
+            c,t=qs
+            columns[c] ^= columns[t]
+            columns[n+t] ^= columns[n+c]
+        elif gate in ('x','z','id'):
+            pass
+        else:
+            raise ValueError('Unsupported exact Clifford+T instruction in independent audit: '+gate)
+    return n, list(reversed(events))
+
+
+def audit_all_accepted_variants_from_qasm(result_dir):
+    """Independent algorithmic check of EVERY accepted branch (no solver re-run).
+
+    Explicitly distinguishes verified graph/color/clique witnesses from exact
+    SAT optimum lower bounds: a SAT UNSAT verdict is not a proof log.
+    """
+    d=pd.read_csv(result_dir/'variant_metrics.csv')
+    valid=d[(d['analysis_success']==True)&(d['equiv_status']=='pass')].copy()
+    findings=[]
+    print(f'  Independent audit of {len(valid)} in-domain, equivalent branches...',flush=True)
+    for count,(_,r) in enumerate(valid.iterrows(),1):
+        cid,st=str(r['circuit_id']),str(r['strategy'])
+        branch=result_dir/'instances'/cid/st
+        rec={'circuit_id':cid,'strategy':st,'family':str(r['family']),
+             'status':'FAIL','labels_match_QASM':False,'edges_match_QASM':False,
+             'proper_coloring':False,'clique_verified':False,
+             'clique_proves_chi':False}
+        try:
+            qasm=(branch/'rebased_ct.qasm').read_text(encoding='utf-8')
+            n,events=independent_pauli_from_qasm(qasm)
+            event_csv=list(csv.DictReader((branch/'pauli_events.csv').open(encoding='utf-8',newline='')))
+            labels=[e[2] for e in events]
+            rec['qubits']=n
+            rec['T_count']=len(labels)
+            rec['labels_match_QASM']=(len(event_csv)==len(events) and all(
+                str(e['pauli'])==sig and str(e['gate'])==gate and int(e['qubit'])==q
+                for e,(gate,q,sig) in zip(event_csv,events)))
+            g=nx.read_graphml(branch/'anticommutation_graph.graphml')
+            g=nx.relabel_nodes(g,{v:int(v) for v in g.nodes()})
+            expected={ (i,j) for i in range(len(labels)) for j in range(i+1,len(labels))
+                       if _label_symplectic(labels[i],labels[j])}
+            observed={tuple(sorted((int(a),int(b)))) for a,b in g.edges()}
+            rec['edges_match_QASM']=(observed==expected and
+                                    set(g.nodes())==set(range(len(labels))))
+            cert=json.loads((branch/'variant_report.json').read_text(encoding='utf-8'))
+            colors={int(i):int(c) for i,c in cert['coloring'].items()}
+            chi=int(r['chi'])
+            rec['proper_coloring']=(len(colors)==len(labels) and
+                set(colors)==set(range(len(labels))) and
+                (1+max(colors.values(),default=-1)==chi) and
+                all(colors[i]!=colors[j] for i,j in expected))
+            witness=[int(v) for v in cert['coloring_certificate'].get('maximum_clique_witness',[])]
+            rec['clique_verified']=(len(set(witness))==len(witness) and
+                all(tuple(sorted((i,j))) in expected for i,j in itertools.combinations(witness,2)))
+            rec['clique_size']=len(witness)
+            rec['reported_chi']=chi
+            rec['clique_proves_chi']=(len(witness)==chi and rec['clique_verified']
+                                       and rec['proper_coloring'])
+            rec['status']='PASS' if all(rec[x] for x in (
+                'labels_match_QASM','edges_match_QASM','proper_coloring','clique_verified')) else 'FAIL'
+        except Exception as exc:
+            rec['error']=repr(exc)
+        findings.append(rec)
+        if count%250==0 or count==len(valid):
+            print(f'   audited {count}/{len(valid)} | failures='
+                  f'{sum(z["status"]!="PASS" for z in findings)}',flush=True)
+    res=pd.DataFrame(findings)
+    out=result_dir/'paper_ready'
+    ensure_dir(out)
+    res.to_csv(out/'all_accepted_branches_independent_Pauli_audit.csv',index=False)
+    counts={'analyzed':len(res),
+            'all_independent_graph_checks_pass':bool((res['status']=='PASS').all()) if not res.empty else False,
+            'failures':int((res['status']!='PASS').sum()) if not res.empty else 0,
+            'clique_and_coloring_optima_certified':int(res['clique_proves_chi'].sum()) if not res.empty else 0,
+            'note':'For non-clique-tight graphs, the original exact search and SAT UNSAT verdict support optimality; this independent audit does not manufacture UNSAT proof logs.'}
+    json_dump(out/'INDEPENDENT_AUDIT_SUMMARY.json',counts)
+    return counts
+
+
+def finish_single_file_reproduction(result_dir):
+    print('\n[IJQI] Producing complete publication evidence...',flush=True)
+    result_dir=Path(result_dir)
+    witness=produce_canonical_witness_evidence(result_dir)
+    print('  Canonical three-strategy witness:',witness['status'],flush=True)
+    family=_paper_family_table(result_dir)
+    plots=_paper_plots(result_dir,family)
+    audit=audit_all_accepted_variants_from_qasm(result_dir)
+    print('  Independent Pauli audit:',audit['analyzed'],'branches,',
+          audit['failures'],'mismatches,',
+          audit['clique_and_coloring_optima_certified'],'clique-tight.',flush=True)
+    if RUN_PROFILE=='paper':
+        consistency=_paper_claim_consistency(result_dir,witness)
+        consistency['independent_audit']=audit
+        if not audit['all_independent_graph_checks_pass']:
+            consistency['status']='MISMATCH'
+        json_dump(result_dir/'PAPER_CLAIM_VALIDATION.json',consistency)
+        print('  Original manuscript numeric claims:',consistency['status'],flush=True)
+    else:
+        consistency={"status":"NOT_APPLICABLE_TO_SUBSET","profile":RUN_PROFILE}
+        json_dump(result_dir/'PAPER_CLAIM_VALIDATION.json',consistency)
+    README=f"""IJQI / ZX normalization sensitivity -- publication output
+
+Mode: {RUN_PROFILE}
+Scripts required: ONE (zx_normalization_sensitivity.py)
+
+The paper profile requires Qiskit, PyZX, python-sat and mqt.qcec; matplotlib
+and pylatexenc are recommended for publication figures. The program deliberately
+fails early if proof or equivalence backends are missing in paper mode.
+
+Core: V8.4 Pauli anticommutation model; chi is NOT physical T depth.
+
+variant_metrics.csv: all attempts incl. rejected/unknown with reasons
+circuit_summary.csv, family_sensitivity_summary.csv: family and circuit analyses
+T_count_matched_pairs.csv: strict same-T pairs
+benchmark_manifest.csv, benchmark_family_design.csv: benchmark details
+strategy_saturation.csv, leave_one_strategy_out.csv: robustness
+performance_summary.csv, failure_forensics.csv, strategy_health.csv: run costs/failures
+instances/: full QASM, graphml, Pauli events, coloring certificates per branch
+paper_witness/: fresh three-branch witness QASM, ZX snapshots, exact-channel proof,
+                exact denominator-T lower bound, clique/coloring and SAT CNFs
+paper_ready/: family runtime tables, plots, all-branch independent Pauli audit
+PAPER_CLAIM_VALIDATION.json: original paper-number comparisons (never altered)
+
+Witness status: {witness.get('status')}
+Claim-consistency status: {consistency.get('status')}
+Paper plots: {plots}
+
+Do not present a partial run, absent QCEC/unknown status or a numerical
+T-count lower bound as an independently verified all-branch proof.
+"""
+    (result_dir/'OUTPUT_README.txt').write_text(README,encoding='utf-8')
+    # Create a compact review bundle; leave raw per-branch files in the folder.
+    zpath=result_dir/'IJQI_KEY_PUBLICATION_EVIDENCE.zip'
+    with zipfile.ZipFile(zpath,'w',zipfile.ZIP_DEFLATED) as z:
+        for p in sorted(result_dir.iterdir()):
+            if p.is_file() and p.suffix.lower() in ('.json','.csv','.txt'):
+                z.write(p,arcname=p.name)
+        for dirname in ['paper_witness','paper_ready','PRIMARY_WITNESS']:
+            folder=result_dir/dirname
+            if folder.exists():
+                for p in folder.rglob('*'):
+                    if p.is_file():
+                        z.write(p,arcname=str(p.relative_to(result_dir)))
+    return {"witness_status":witness['status'],
+            "claim_validation":consistency['status'],
+            "outputs":str(result_dir.resolve()),"paper_figures":plots,
+            "independent_audit":audit}
+
+
+if __name__ == '__main__':
+    print('='*72)
+    print('ZX NORMALIZATION SENSITIVITY | IJQI SINGLE-FILE REPRODUCTION')
+    print('Profile:',RUN_PROFILE,'| Script:',Path(__file__).resolve())
+    print('Output:',OUTPUT_DIR)
+    print('='*72,flush=True)
+    main()  # The full validated V8.4 pipeline, without external helper modules.
+    report=finish_single_file_reproduction(OUTPUT_DIR)
+    print('\nPUBLICATION OUTPUT STATUS:',json.dumps(report,indent=2),flush=True)
