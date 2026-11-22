@@ -1,12 +1,16 @@
+# Dependencies for the paper reproduction
+# Archived experiment: Python 3.10
+
 qiskit
 numpy
 pandas
 networkx
 matplotlib
-python-sat[pblib,aiger]
-pyzx
+python-sat
+pyzx==0.10.2
 mqt.qcec
-pytket
-pytket-qiskit
-pynauty
-scipy
+pylatexenc
+
+# Optional tket integration
+# pytket
+# pytket-qiskit
